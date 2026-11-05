@@ -1,0 +1,26 @@
+from Crypto.Util.number import *
+import binascii
+import gmpy2
+
+flag = '****************************************'
+hex_flag=int(flag.encode("hex"),16)
+
+p=getPrime(100)
+q=gmpy2.next_prime(p)
+r=gmpy2.next_prime(q)
+s=gmpy2.next_prime(r)
+n=p*q*r*s
+
+e=0x10001
+c=pow(hex_flag,e,n)
+
+print("n=",hex(n))
+print("e=",hex(e))
+print("c=",hex(c))
+
+'''
+('n=', '0x73891b82da461e3669ceff8c043f402750988463db921efd664b3a3280ff44e47bfdb54a64c11cbf2f26cc924d55b209feeb')
+('e=', '0x10001')
+('c=', '0xb48e63c7e684fddde320f252da89437f9f42415662c2fadeb8adc94508a8d360aa92324b1c81253c2602dcd038fb11e295f')
+'''
+

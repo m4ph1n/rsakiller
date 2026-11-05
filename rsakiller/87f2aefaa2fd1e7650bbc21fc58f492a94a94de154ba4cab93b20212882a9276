@@ -1,0 +1,27 @@
+from Crypto.Util.number import *
+import binascii
+import gmpy2
+
+flag = '****************************************'
+hex_flag=int(flag.encode("hex"),16)
+p=getPrime(512)
+q=getPrime(512)
+n=p*q
+e=0x10001
+c=pow(hex_flag,e,n)
+
+phi=(p-1)*(q-1)
+d=gmpy2.invert(e,phi)
+dp=d%(p-1)
+print("dp=",hex(dp))
+print("n=",hex(n))
+print("e=",hex(e))
+print("c=",hex(c))
+
+'''
+('dp=', '0x747deb471c3cdba18c487e32353bb2da310d74af903640890dba99764cb42fc9c8728c5f34b5545f8f37e7fec014674dcf046c1b9f3c6e0be0e06f132a07eb47')
+('n=', '0xbc2de6ccc7b2f59793390a91edb2fe52e907dc595870cf69c1305b362eea8b15a45b2e984f9d1d7944f832cbd7b6c527071f07d60280f5330daebf4ae4f444f2990dd60216238a8a1c4fb11ec2fcff57068f15ea9001d710ea7cd3d3b97d95674ee4190f58a2fdb2f98a9b02efa846fd60c5c5e0ddd850242e375e565c4075efL')
+('e=', '0x10001')
+('c=', '0x60a0ec76984980dcbfcf43db4d03c06e161b62181f9e40acd86ebd033d5823c163429c21fc6f653b6c220546ff7854033bf1eebc105d118834797a7d27f67b1fa2b6af02ec5baaef4907084d1781349273c2bd9ef6ab73d9681313f243ca76893233739b3cc0701d4aeef68b2f283c5333320ac86c2166780a8e261541bca6dfL')
+'''
+
