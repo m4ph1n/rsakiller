@@ -139,8 +139,32 @@ def factordb(n: int, timeout: float = 15.0) -> List[int]:
         return []
 
 
+def sage_factor(n: int, timeout: float = 120.0) -> Dict[int, int]:
+    """用 Sage 的 PARI/ECM 分解。
+
+    纯 Python 的 Pollard rho 对 60 bit 以上的因子基本无望，而 Sage 的
+    ECM 在几十秒内就能吃掉这种规模。不可用时返回空字典。
+    """
+    from . import sagebridge as SB
+
+    if not SB.available():
+        return {}
+    res = SB.run_jobs([{"op": "factor", "n": str(n)}], timeout=timeout)
+    if not res or not res[0].get("ok"):
+        return {}
+    fac: Dict[int, int] = {}
+    for base, exp in res[0].get("factors") or []:
+        fac[int(base)] = fac.get(int(base), 0) + int(exp)
+    prod = 1
+    for p, k in fac.items():
+        prod *= p ** k
+    if prod != int(n):
+        return {}
+    return fac
+
+
 def factor(n: int, timeout: float = 30.0, use_online: bool = True,
-           verbose: bool = False) -> Dict[int, int]:
+           verbose: bool = False, use_sage: bool = False) -> Dict[int, int]:
     """完整分解，返回 {素因子: 指数}。分不干净时把剩余合数也放进去。"""
     n = int(n)
     if n <= 1:
@@ -192,6 +216,18 @@ def factor(n: int, timeout: float = 30.0, use_online: bool = True,
 
     # 3. 在线兜底
     remaining = [x for x in fac if not U.is_probable_prime(x)]
+
+    # 4. Sage ECM：纯 Python 方法对 >60 bit 的因子基本无望
+    if remaining and use_sage:
+        for comp in remaining:
+            got = sage_factor(comp, timeout=min(180.0, max(30.0, timeout * 3)))
+            if not got:
+                continue
+            del fac[comp]
+            for g, k in got.items():
+                fac[g] = fac.get(g, 0) + k
+        remaining = [x for x in fac if not U.is_probable_prime(x)]
+
     if remaining and use_online:
         for comp in remaining:
             got = factordb(comp)

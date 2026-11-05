@@ -22,6 +22,7 @@ class Options:
     sage_timeout: float = 900.0
     bd_delta: float = 0.26
     m_prefix: Optional[str] = None
+    m_suffix: Optional[str] = None
     m_unknown_len: int = 0
     m_unknown_bits: Optional[int] = None
     related: Optional[tuple] = None
@@ -81,6 +82,8 @@ def explain(ctx: RSAContext, res: Optional[A.Result]) -> str:
     """给出结论 + 失败时的下一步建议。"""
     if res and res.m is not None:
         return ""
+    from . import special as SP
+
     tips = []
     n = ctx.n
     e = ctx.e
@@ -89,10 +92,14 @@ def explain(ctx: RSAContext, res: Optional[A.Result]) -> str:
     if e:
         tips.append(f"e = {e if e.bit_length() < 64 else str(e)[:20] + '...'}")
     advice = []
+    if n and SP.is_roca_vulnerable(n):
+        advice.append("n 落在 ROCA 的小群结构上（CVE-2017-15361），可用 roca 工具专解")
     if n and n.bit_length() >= 1024:
         advice.append("n 较大，常规分解无望 —— 重点看题目有没有额外泄露（dp/dq、p 的高位、d 的大小）")
     if e and n and e > n // 2:
         advice.append("e 接近 n：优先确认是不是小 d 题（Wiener / Boneh-Durfee），或 e 与 phi 不互素")
+    if ctx.phi is None and n and n.bit_length() <= 2048 and not advice:
+        advice.append("若题面给了 phi，请用 --phi 传入，可直接反解 p、q")
     if not advice:
         advice.append("把完整题面（含所有数字、提示语）贴进来，比只给 n/e/c 更容易命中")
     return " · ".join(tips) + "\n  建议：" + "；".join(advice)

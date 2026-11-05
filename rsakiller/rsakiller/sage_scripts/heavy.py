@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Sage 侧重型攻击实现，由 sagebridge 以 `sage -python heavy.py task.json res.json` 调用。
+"""Sage 侧重型攻击实现。
+
+两种调用方式共用 `run_batch()`：
+- 一次性：`sage -python heavy.py task.json result.json`，或经环境变量传路径。
+- 常驻：`sage -python heavy.py --serve`，从 stdin 按行读 JSON 请求、向 stdout 写 JSON 响应，
+  避免每次任务都重付 Sage 启动成本（本机 Cygwin 版约 6~10 秒）。
 
 任务协议（JSON 数组）：
   {"op": "partial_p", "n": "...", "hint": "...", "unknown_bits": 128, "mode": "high"|"low"}
@@ -11,6 +16,12 @@
 
 结果协议（JSON 数组，与任务一一对应）：
   {"ok": true, "value": "..."}  |  {"ok": false, "err": "..."}
+
+常驻协议（每行一个 JSON）：
+  请求 {"jobs": [...]}  → 响应 {"ok": true, "results": [...]}
+  请求 {"op": "__ping__"} → 响应 {"ok": true, "ready": true}（不触发任何 Sage 计算）
+  请求 {"op": "__quit__"} → 退出进程
+启动完成后先输出一行 {"ready": true}，调用方据此确认可发任务。
 """
 import json
 import math
@@ -190,6 +201,35 @@ def op_partial_p(job):
             p = r * shift + hint
             if p > 1 and n % p == 0:
                 return {"ok": True, "value": str(p)}
+    return {"ok": False, "err": "Coppersmith 未给出因子"}
+
+
+def op_partial_p_low(job):
+    """已知 p 的低若干位：p = x·2^k + p_low，用 Coppersmith 补出高位。
+
+    shift 由已知位数决定，X 由未知位数（n 的位宽减去已知位数）决定，
+    两者混用会让多项式描述成另一个 p。beta 取 0.49 而非 0.5：真实因子
+    可能略小于 √n，用 0.49 才能保证「除数 ≥ N^beta」这个前提不被破坏。
+    """
+    n = int(_num(job["n"]))
+    p_low = int(_num(job["p_low"]))
+    known = int(job["known_bits"])
+    beta = float(job.get("beta", 0.49))
+    pbits = (int(n).bit_length() + 1) // 2
+    unknown = pbits - known
+    if known <= 0 or unknown <= 0:
+        return {"ok": False, "err": "位数不合理"}
+    shift = 1 << known
+    try:
+        iv = int(inverse_mod(shift, n))
+    except Exception:
+        return {"ok": False, "err": "shift 与 n 不互素"}
+    # f(x) = shift·x + p_low 先化首一：乘以 shift^-1
+    roots = coppersmith_lll([(p_low * iv) % n, 1], n, beta=beta, X=1 << unknown)
+    for r in roots:
+        p = r * shift + p_low
+        if 1 < p < n and n % p == 0:
+            return {"ok": True, "value": str(p)}
     return {"ok": False, "err": "Coppersmith 未给出因子"}
 
 
@@ -473,33 +513,44 @@ def op_franklin_reiter(job):
     return {"ok": False, "err": "未找到共同根"}
 
 
+# ---------------------------------------------------------------------------
+# 整数分解（Sage 的 PARI/ECM，远强于纯 Python 的 rho）
+# ---------------------------------------------------------------------------
+def op_factor(job):
+    n = int(_num(job["n"]))
+    try:
+        f = ZZ(n).factor()
+    except Exception as exc:
+        return {"ok": False, "err": "factor: %s" % exc}
+    return {"ok": True, "factors": [[str(p), int(e)] for p, e in f]}
+
+
 OPS = {
     "ping": lambda job: {"ok": True, "value": "pong"},
     "partial_p": op_partial_p,
+    "partial_p_low": op_partial_p_low,
     "message_high": op_message_high,
     "stereotyped": op_stereotyped,
     "boneh_durfee": op_boneh_durfee,
     "small_roots": op_small_roots,
     "franklin_reiter": op_franklin_reiter,
     "nth_root": op_nth_root,
+    "factor": op_factor,
 }
 
 
-def main():
-    task_path = sys.argv[1] if len(sys.argv) >= 3 else os.environ.get("RSAKILLER_TASK", "")
-    res_path = sys.argv[2] if len(sys.argv) >= 3 else os.environ.get("RSAKILLER_RESULT", "")
-    if not task_path or not res_path:
-        print("usage: heavy.py task.json result.json (or set RSAKILLER_TASK/RESULT)", file=sys.stderr)
-        return 2
-    with open(task_path, "r", encoding="utf-8") as f:
-        jobs = json.load(f)
+def run_batch(jobs):
+    """顺序执行一批任务，返回与输入一一对应的结果列表。
+
+    单个任务抛异常只标记该任务失败，不影响同批其它任务。
+    """
     out = []
     for job in jobs:
         op = job.get("op", "")
         fn = OPS.get(op)
         t0 = time.time()
         if fn is None:
-            out.append({"ok": False, "err": "未知 op: %s" % op})
+            out.append({"ok": False, "err": "未知 op: %s" % op, "op": op})
             continue
         try:
             r = fn(job)
@@ -509,6 +560,51 @@ def main():
         # 注意：Sage 的 round 返回 RealDoubleElement，必须显式转 float 才能 JSON 序列化
         r["secs"] = float(round(float(time.time() - t0), 2))
         out.append(r)
+    return out
+
+
+def serve():
+    """常驻模式：按行收发 JSON，Sage 只启动并初始化一次。"""
+    try:
+        from sage.version import version as sage_version
+    except Exception:
+        sage_version = ""
+    sys.stdout.write(json.dumps({"ready": True, "sage_version": str(sage_version)}) + "\n")
+    sys.stdout.flush()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError as exc:
+            sys.stdout.write(json.dumps({"ok": False, "err": "JSON 解析失败: %s" % exc}) + "\n")
+            sys.stdout.flush()
+            continue
+        op = msg.get("op")
+        if op == "__quit__":
+            return 0
+        if op == "__ping__":
+            sys.stdout.write(json.dumps({"ok": True, "ready": True}) + "\n")
+            sys.stdout.flush()
+            continue
+        results = run_batch(msg.get("jobs") or [])
+        sys.stdout.write(json.dumps({"ok": True, "results": results}) + "\n")
+        sys.stdout.flush()
+    return 0
+
+
+def main():
+    if "--serve" in sys.argv[1:]:
+        return serve()
+    task_path = sys.argv[1] if len(sys.argv) >= 3 else os.environ.get("RSAKILLER_TASK", "")
+    res_path = sys.argv[2] if len(sys.argv) >= 3 else os.environ.get("RSAKILLER_RESULT", "")
+    if not task_path or not res_path:
+        print("usage: heavy.py task.json result.json (or set RSAKILLER_TASK/RESULT)", file=sys.stderr)
+        return 2
+    with open(task_path, "r", encoding="utf-8") as f:
+        jobs = json.load(f)
+    out = run_batch(jobs)
     with open(res_path, "w", encoding="utf-8") as f:
         json.dump(out, f)
     return 0
