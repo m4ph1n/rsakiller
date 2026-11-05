@@ -8,8 +8,9 @@
 """
 from __future__ import annotations
 
+import itertools
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 import gmpy2
 from gmpy2 import mpfr, mpz
@@ -288,18 +289,34 @@ def factor_high_bits(n: int, p_high: int, unknown_bits: int, verbose: bool = Fal
     return None
 
 
-def factor_low_bits(n: int, p_low: int, unknown_bits: int, verbose: bool = False) -> Optional[int]:
-    """p = x * 2^k + p_low，已知低位，求 p。"""
-    shift = 1 << unknown_bits
+def factor_low_bits(n: int, p_low: int, known_bits: int, verbose: bool = False,
+                    beta: float = 0.49) -> Optional[int]:
+    """已知 p 的低 known_bits 位，用 Coppersmith 补出高位。
+
+    p = x·2^known_bits + p_low，未知部分 x 的位宽由 n 的位宽推出。
+    shift 与 X 必须是两个不同的量：shift 由已知位数决定，
+    X 由未知位数决定；把二者混用会让多项式描述的是另一个 p。
+
+    beta 取 0.49 而非 0.5：真实因子可能略小于 √n（高位不足），
+    用 0.49 能保证「除数 ≥ N^beta」这个前提依然成立，否则边界处会静默失败。
+    """
+    if known_bits <= 0:
+        return None
+    pbits = (U.nbit(n) + 1) // 2
+    unknown_bits = pbits - known_bits
+    if unknown_bits <= 0:
+        return None
+    shift = 1 << known_bits
     # f(x) = shift*x + p_low ；先化首一：乘以 shift^-1
     iv = U.inv(shift, n)
     if iv is None:
         return None
     coeffs = [(p_low * iv) % n, 1]
-    roots = coppersmith_univariate(coeffs, n, beta=0.5, X=1 << unknown_bits, verbose=verbose)
+    roots = coppersmith_univariate(coeffs, n, beta=beta, X=1 << unknown_bits,
+                                   verbose=verbose)
     for r in roots:
         p = r * shift + p_low
-        if p > 1 and n % p == 0:
+        if 1 < p < n and n % p == 0:
             return p
     return None
 
@@ -332,14 +349,22 @@ def message_high_bits(n: int, e: int, c: int, m_high: int, unknown_bits: int = 0
 
 def stereotyped_message(n: int, e: int, c: int, prefix: bytes = b"", suffix: bytes = b"",
                         unknown_len: int = 0, verbose: bool = False) -> List[int]:
-    """已知明文前后缀（stereotyped message），爆破中间未知字节。"""
+    """已知明文前后缀（stereotyped message），爆破中间未知字节。
+
+    m = pre·2^(8·(unknown+suf_len)) + x·2^(8·suf_len) + suf，求小根 x。
+    """
     pre = U.bytes_to_long(prefix) if prefix else 0
     suf = U.bytes_to_long(suffix) if suffix else 0
     shift = 1 << (8 * unknown_len)
-    # m = pre * 2^(8*(unknown_len+len(suffix))) + x * 2^(8*len(suffix)) + suf
-    high = pre * (1 << (8 * (unknown_len + (len(suffix)))))
+    if shift <= 1 or U.nbit(n) < 1:
+        return []
+    high = pre * (1 << (8 * (unknown_len + len(suffix))))
     low = suf
     X = 1 << (8 * unknown_len)
+    # X 必须小于 n^(1/e)，否则 Coppersmith 的可行域不成立，白跑 LLL
+    bound, _ = U.iroot(n, e) if e > 0 else (0, False)
+    if X >= bound:
+        return []
     base = [(high + low) % n, (1 << (8 * len(suffix))) % n]
     poly = [1]
     for _ in range(e):
@@ -352,3 +377,107 @@ def stereotyped_message(n: int, e: int, c: int, prefix: bytes = b"", suffix: byt
         if U.powmod(m, e, n) == c % n:
             out.append(m)
     return out
+
+
+# --------------------------------------------------------------------------
+# 短填充（short pad）：m2 = m1 + δ，δ 未知但很小
+# --------------------------------------------------------------------------
+def _short_pad_resultant(e: int, c1: int, c2: int, n: int) -> List[int]:
+    """在 Z_n[y]/(x^e - c1) 里求 (x+y)^e - c2 与它的结式，得到 y 的多项式。
+
+    y 就是两条明文的差 δ。结式按 x^e ≡ c1 归约后只剩 e+1 项，
+    于是 δ 是模 n 下这个小次数多项式的根。
+    """
+    # 以 x^k (0<=k<e) 为基，构造「乘以 (x+y)^e - c2」的乘法矩阵
+    size = e
+    mat = [[[0] * (e + 1) for _ in range(size)] for _ in range(size)]
+    for col in range(size):
+        for x_power in range(e + 1):
+            row = (col + x_power) % e
+            reduce_by = c1 if col + x_power >= e else 1
+            y_power = e - x_power
+            mat[row][col][y_power] += math.comb(e, x_power) * reduce_by
+            if x_power == 0:
+                mat[row][col][0] -= c2
+
+    # 行列式（按 y 的多项式做，系数模 n）
+    det = [0]
+    for perm in itertools.permutations(range(size)):
+        inversions = sum(perm[i] > perm[j] for i in range(size)
+                         for j in range(i + 1, size))
+        term = [1]
+        for row, col in enumerate(perm):
+            factor = mat[row][col]
+            product = [0] * (len(term) + len(factor) - 1)
+            for i, ti in enumerate(term):
+                if ti:
+                    for j, fj in enumerate(factor):
+                        if fj:
+                            product[i + j] += ti * fj
+            term = product
+        if len(det) < len(term):
+            det.extend([0] * (len(term) - len(det)))
+        sign = -1 if inversions % 2 else 1
+        for deg, coef in enumerate(term):
+            det[deg] += sign * coef
+    # 结式只含 y^e 的倍次幂，约掉一个 y 因子后取模
+    return [det[deg * e] % n for deg in range(e + 1)]
+
+
+def short_pad(n: int, e: int, c1: int, c2: int, verbose: bool = False):
+    """短填充攻击，返回 (m1, m2) 或 None。
+
+    δ < n^(1/e²) 时，δ^e 的搜索空间约 n^(1/e)，落在 Coppersmith 可行域内。
+    解出 δ^e 后开 e 次方得 δ，再用 Franklin-Reiter 精确求出两条明文。
+
+    上界必须按实际可行域收紧：结式是 e 次多项式，Coppersmith 要求
+    X ≤ N^(beta²/delta) = N^(1/e)，而 delta = e 时余量极小，直接从
+    N^(1/e) 起步几乎必然失败。这里从一个小得多的初值开始逐级放大，
+    每级都真跑一次 LLL —— δ 通常比理论上界小好几个数量级。
+    """
+    if e < 2 or e > 5:
+        return None
+    coeffs = _short_pad_resultant(e, c1 % n, c2 % n, n)
+    while len(coeffs) > 1 and coeffs[-1] == 0:
+        coeffs.pop()
+    if len(coeffs) < 2:
+        return None
+
+    # 理论上界 X_z = n^(1/e)；实际从小往上放大，避免边界处白跑大格
+    top, _ = U.iroot(n, e)
+    bits = max(8, int(U.nbit(top) * 0.5))
+    top_bits = U.nbit(top)
+    while bits <= top_bits:
+        x_z = 1 << bits
+        roots = coppersmith_univariate(coeffs, n, beta=1.0, X=x_z, verbose=verbose)
+        for z in roots:
+            delta, exact = U.iroot(z, e)
+            if not exact or delta == 0:
+                continue
+            got = franklin_reiter(n, e, c1, c2, 1, delta)
+            if got:
+                return got
+        if bits >= top_bits:
+            break
+        bits = min(bits * 2, top_bits)
+    return None
+
+
+def franklin_reiter(n: int, e: int, c1: int, c2: int, a: int, b: int):
+    """m2 = a·m1 + b 时求 (m1, m2)。返回 (m1, m2) 或 None。"""
+    if n <= 1 or e < 2:
+        return None
+    p1 = [(-c1) % n] + [0] * (e - 1) + [1]
+    base = [b % n, a % n]
+    poly = [1]
+    for _ in range(e):
+        poly = U.poly_mulmod(poly, base, n)
+    poly[0] = (poly[0] - c2) % n
+    g, _factor = U.poly_gcd_mod(p1, poly, n)
+    if not g or len(g) != 2 or not g[1]:
+        return None
+    m1 = (-g[0] * U.inv(g[1], n)) % n
+    m2 = (a * m1 + b) % n
+    if U.powmod(m1, e, n) != c1 % n or U.powmod(m2, e, n) != c2 % n:
+        return None
+    return m1, m2

@@ -50,10 +50,14 @@ def _build_ctx(args) -> RSAContext:
         raw = _read_input(args)
         ctx = parse_any(raw) if raw.strip() else RSAContext()
     # 命令行参数优先级最高
-    for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq"):
+    for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "qinv", "phi",
+               "near_p", "sig", "good_sig", "signed_msg"):
         v = getattr(args, nm, None)
         if v is not None:
             setattr(ctx, nm, v)
+    if args.d_low is not None:
+        ctx.d_low = args.d_low
+        ctx.d_low_bits = args.d_known_bits or args.d_low.bit_length()
     if args.n and args.ns:
         ctx.ns = args.ns
     if args.cs:
@@ -86,7 +90,8 @@ def _print_result(ctx: RSAContext, res: A.Result) -> None:
     if res.factors:
         for p, k in res.factors.items():
             tag = "" if U.is_probable_prime(p) else "  <- 合数?"
-            print(f"  p/q = {_fmt_int(p, 72)}{tag}")
+            exp = f"^{k}" if k > 1 else ""
+            print(f"  p/q = {_fmt_int(p, 72)}{exp}{tag}")
     if res.m is None:
         print("  (无明文)")
         return
@@ -102,6 +107,17 @@ def _print_result(ctx: RSAContext, res: A.Result) -> None:
     else:
         print("  >>> (明文不是可读文本，可能是杂凑或需要额外解码)")
         print(f"  bytes = {U.long_to_bytes(res.m)[:48]!r}")
+    # e 与 phi 不互素时，满足 m^e ≡ c 的明文不止一个：全部列出来，由人判断。
+    if res.candidates and len(res.candidates) > 1:
+        print()
+        print(f"  注意：共有 {len(res.candidates)} 个明文都满足 c = m^e mod n，"
+              f"上面只是最像 flag 的一个。其余候选：")
+        for i, cand in enumerate(res.candidates, 1):
+            if cand == res.m:
+                continue
+            text = U.guess_text(cand)
+            shown = text.decode("utf-8", "replace") if text else U.long_to_bytes(cand)[:32].hex()
+            print(f"    [{i}] {shown}")
 
 
 def _emit_script(path: str, ctx: RSAContext, res: A.Result) -> None:
@@ -158,10 +174,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--d", type=lambda s: int(s, 0))
     p.add_argument("--dp", type=lambda s: int(s, 0))
     p.add_argument("--dq", type=lambda s: int(s, 0))
+    p.add_argument("--qinv", type=lambda s: int(s, 0), help="q 关于 p 的模逆")
+    p.add_argument("--phi", type=lambda s: int(s, 0), help="欧拉函数 phi(n)")
+    p.add_argument("--near-p", type=lambda s: int(s, 0), help="p 的近似值（差一点点）")
+    p.add_argument("--d-low", type=lambda s: int(s, 0), help="d 的低若干位（partial key exposure）")
+    p.add_argument("--d-known-bits", type=int, help="--d-low 明确声明了多少位（含前导零）")
+    p.add_argument("--sig", type=lambda s: int(s, 0), help="RSA-CRT 故障签名")
+    p.add_argument("--good-sig", type=lambda s: int(s, 0), help="同一消息的正确签名")
+    p.add_argument("--signed-msg", type=lambda s: int(s, 0), help="被签名的（填充后）消息整数")
     p.add_argument("--ns", type=lambda s: [int(x, 0) for x in s.split(",")], help="多个模数，逗号分隔")
     p.add_argument("--cs", type=lambda s: [int(x, 0) for x in s.split(",")], help="多个密文，逗号分隔")
     p.add_argument("--hint", type=lambda s: int(s, 0), help="题目泄露的数（p 的高位等）")
-    p.add_argument("--pem", help="公钥文件（PEM/DER）")
+    p.add_argument("--pem", help="公钥或私钥文件（PEM/DER）")
     p.add_argument("--only", help="只跑指定攻击，逗号分隔")
     p.add_argument("--skip", help="跳过指定攻击，逗号分隔")
     p.add_argument("--list", action="store_true", help="列出所有攻击")
@@ -174,7 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-k", type=int, default=200_000, help="低指数爆破上限 k")
     p.add_argument("--factor-timeout", type=float, default=20.0)
     p.add_argument("--prefix", help="已知明文前缀，如 'flag{'")
-    p.add_argument("--unknown-len", type=int, default=0, help="前缀后未知字节数")
+    p.add_argument("--suffix", help="已知明文后缀，如 '}'")
+    p.add_argument("--unknown-len", type=int, default=0, help="前缀与后缀之间未知的字节数")
     p.add_argument("--m-unknown-bits", type=int, help="已知明文高位时未知的位数")
     p.add_argument("--related", help="相关消息系数 a,b（m2 = a*m1 + b）")
     p.add_argument("--emit", help="把命中方案写成复现脚本")
@@ -215,6 +240,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         sage_timeout=args.sage_timeout,
         bd_delta=args.bd_delta,
         m_prefix=args.prefix,
+        m_suffix=args.suffix,
         m_unknown_len=args.unknown_len,
         m_unknown_bits=args.m_unknown_bits,
         related=tuple(int(x) for x in args.related.split(",")) if args.related else None,
@@ -265,6 +291,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "m": str(res.m) if res and res.m is not None else None,
             "hex": hex(res.m) if res and res.m is not None else None,
             "text": (res.text() or b"").decode("utf-8", "replace") if res else None,
+            "candidates": (
+                [{ "m": str(c), "text": (U.guess_text(c) or b"").decode("utf-8", "replace")}
+                 for c in res.candidates]
+                if res and res.candidates else []
+            ),
             "elapsed": round(total, 3),
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))

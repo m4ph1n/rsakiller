@@ -9,11 +9,12 @@ CTF RSA 通杀工具：自动解析题目参数，按「廉价攻击 → Sage �
 | 模块 | 职责 |
 | --- | --- |
 | `rsakiller/cli.py` | 命令行入口，支持多文件输入（题目脚本 + 输出数据一起喂） |
-| `rsakiller/ctx.py` | 参数解析：从代码/文本/注释中提取 n、e、c、p、q、dp、hint 等 |
+| `rsakiller/ctx.py` | 参数解析：从代码/文本/注释中提取 n、e、c、p、q、dp、phi、near_p、d 低位、故障签名等 |
 | `rsakiller/solver.py` | 攻击编排与结果校验 |
-| `rsakiller/attacks.py` | 纯 Python 攻击集（直接解密、小 q、Fermat、共模、广播、Wiener 等） |
+| `rsakiller/attacks.py` | 纯 Python 攻击集（直接解密、小 q、Fermat、共模、广播、Wiener、Bellcore 等） |
+| `rsakiller/special.py` | 特殊结构分解：素数幂、两平方和、强伪素数、Williams p+1、著名数列、ROCA 检测 |
 | `rsakiller/bonedurfee.py` | Boneh-Durfee 格攻击 |
-| `rsakiller/lll.py` | 纯 Python LLL 实现 |
+| `rsakiller/lll.py` | 纯 Python LLL 实现（Coppersmith、Franklin-Reiter、短填充） |
 | `rsakiller/modular.py` | 模运算工具 |
 | `rsakiller/mt19937.py` | MT19937 状态恢复与种子预测 |
 | `rsakiller/oracle.py` | 加解密/根运算封装 |
@@ -35,13 +36,47 @@ cat output.txt | python -m rsakiller -
 
 # 只用纯 Python，不启动 Sage
 python -m rsakiller --no-sage challenge.py
+
+# 手给泄露量：phi、p 的近似值、d 的低位、RSA-CRT 故障签名
+python -m rsakiller -n 0x.. -e 65537 -c 0x.. --phi 0x..
+python -m rsakiller -n 0x.. -e 65537 --near-p 0x..
+python -m rsakiller -n 0x.. -e 3 --d-low 0x.. --d-known-bits 300
+python -m rsakiller -n 0x.. -e 65537 --sig 0x.. --signed-msg 0x..
+
+# 已知明文的前后缀，中间一段未知
+python -m rsakiller -n 0x.. -e 3 -c 0x.. --prefix 'flag{' --suffix '}' --unknown-len 16
+
+# 查看全部攻击
+python -m rsakiller --list
 ```
+
+## 攻击清单
+
+`python -m rsakiller --list` 会打印完整列表。按能力分组：
+
+**参数泄露 / 直接解密**：`known_pq`、`known_d`、`known_phi`、`dp_dq_leak`、`d_leak`、`c_gcd_n`、`rsa_crt_fault`（Bellcore 故障签名）、`mt_replay`（MT19937 重放）
+
+**低指数 / 共模 / 相关消息**：`small_e_root`、`hastad`、`common_modulus`（含 gcd(e₁,e₂)>1）、`franklin_reiter`、`short_pad`（填充差未知）、`stereotyped`（已知明文前后缀）
+
+**小私钥 / 近似参数**：`wiener`、`boneh_durfee`、`approx_power`（e ≈ n^k·v/u）、`near_p`（p 的近似值）、`partial_d`（d 的低位）
+
+**部分信息（Coppersmith）**：`partial_p`（p 的高位或低位）、`m_high`（明文高位）、`stereotyped`
+
+**n 的结构弱点**：`prime_power`（n = p^k）、`non_rsa`（n 是素数或素数幂）、`fermat` / `fermat_multiplier`、`special_structure`（Carmichael 数、Fibonacci/Lucas/阶乘等序列构造、Euler 两平方和）、`novelty_prime`
+
+**分解兜底**：`small_q`、`common_factor`、`factordb`、`factorize`、`sage_heavy`
+
+### 关于多解
+
+`e` 与 `phi` 不互素时，满足 `c = m^e mod n` 的明文本来就不止一个（彼此差在尾部填充）。
+工具会给出最像 flag 的那个，同时把**全部候选**列在结果里（`--json` 下有 `candidates` 字段），
+由人确认。命令末尾的「注意」块就是这层提示。
 
 ## 自测
 
 ```bash
-python tests/selftest.py --no-sage     # 15 项纯 Python
-python tests/selftest.py --with-sage   # 17 项，含格攻击
+python tests/selftest.py --no-sage     # 24 项纯 Python
+python tests/selftest.py --with-sage   # 26 项，含格攻击
 ```
 
 ## Sage 集成说明

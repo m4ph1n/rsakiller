@@ -29,9 +29,15 @@ _NAME_MAP = {
     "q": "q", "qq": "q", "prime2": "q",
     "d": "d", "dd": "d", "priv": "d", "privkey": "d", "private": "d",
     "dp": "dp", "dq": "dq", "d_p": "dp", "d_q": "dq", "dmp1": "dp", "dmq1": "dq",
+    "qinv": "qinv", "qi": "qinv", "q_inv": "qinv", "iqmp": "qinv",
+    "pinv": "pinv", "p_inv": "pinv", "ipmq": "pinv",
     "phi": "phi", "phin": "phi", "phip": "phi", "varphi": "phi", "fn": "phi",
     "hint": "hint", "leak": "leak", "high": "hint", "p_high": "hint",
     "ph": "hint", "leak_p": "hint", "hp": "hint", "pbar": "hint",
+    "near_p": "near_p", "nearp": "near_p", "p_approx": "near_p", "pbar_near": "near_p",
+    "sig": "sig", "signature": "sig", "fault_sig": "sig", "faulty_sig": "sig",
+    "good_sig": "good_sig", "correct_sig": "good_sig",
+    "msig": "signed_msg", "signed_msg": "signed_msg", "m_signed": "signed_msg",
     "m": "m", "flag": "m", "msg": "m", "message": "m",
     "flag_ct": "c", "flagciphertext": "c", "flag_ciphertext": "c",
     "hint_ct": "hint_ct", "hintciphertext": "hint_ct", "hint_ciphertext": "hint_ct",
@@ -94,8 +100,19 @@ class RSAContext:
     d: Optional[int] = None
     dp: Optional[int] = None
     dq: Optional[int] = None
+    qinv: Optional[int] = None
     phi: Optional[int] = None
     m_hint: Optional[int] = None
+
+    # 部分信息泄露：near_p 是 p 的近似值（可以差一点点），d_low 是 d 的低位
+    near_p: Optional[int] = None
+    d_low: Optional[int] = None
+    d_low_bits: Optional[int] = None
+
+    # RSA-CRT 故障签名：sig 是错的那条，good_sig / signed_msg 用来核对
+    sig: Optional[int] = None
+    good_sig: Optional[int] = None
+    signed_msg: Optional[int] = None
 
     # 多组参数
     ns: List[int] = field(default_factory=list)
@@ -115,7 +132,7 @@ class RSAContext:
 
     def summary(self) -> str:
         lines = []
-        for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "phi"):
+        for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "qinv", "phi"):
             v = getattr(self, nm)
             if v is None:
                 continue
@@ -123,6 +140,17 @@ class RSAContext:
             if len(s) > 40:
                 s = s[:16] + f"...({v.bit_length()}bit)"
             lines.append(f"  {nm:4s} = {s}")
+        if self.near_p:
+            s = str(self.near_p)
+            if len(s) > 40:
+                s = s[:16] + f"...({self.near_p.bit_length()}bit)"
+            lines.append(f"  near_p = {s}（p 的近似值）")
+        if self.d_low is not None:
+            bits = self.d_low_bits or self.d_low.bit_length()
+            lines.append(f"  d_low = {self.d_low if self.d_low.bit_length() < 128 else str(self.d_low)[:24] + '...'}"
+                         f"（d 的低 {bits} bit）")
+        if self.sig is not None:
+            lines.append(f"  sig  = {str(self.sig)[:24]}...（RSA-CRT 故障签名）")
         if len(self.ns) > 1:
             lines.append(f"  ns   = {len(self.ns)} 个模数")
         if len(self.es) > 1:
@@ -140,7 +168,8 @@ class RSAContext:
         return "\n".join(lines) if lines else "  (空)"
 
     def extend_from(self, other: "RSAContext") -> None:
-        for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "phi", "m_hint"):
+        for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "qinv", "phi", "m_hint",
+                   "near_p", "d_low", "d_low_bits", "sig", "good_sig", "signed_msg"):
             if getattr(self, nm) is None and getattr(other, nm) is not None:
                 setattr(self, nm, getattr(other, nm))
 
@@ -183,7 +212,8 @@ def parse_text(text: str) -> RSAContext:
             quoted.setdefault(nm, []).append(val)
 
     # 单值直接落位（普通赋值优先，引号形式补缺）
-    for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "phi"):
+    for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "qinv", "phi",
+               "near_p", "sig", "good_sig", "signed_msg"):
         vals = [v for v in (singles.get(nm) or quoted.get(nm) or []) if v > 0]
         if vals:
             setattr(ctx, nm, vals[0])
@@ -257,8 +287,28 @@ def parse_text(text: str) -> RSAContext:
     if re.search(r"\bp\s*>\s*q\b|p\s*-\s*q", low):
         ctx.notes.append("题目暗示 p、q 接近")
 
+    # 部分私钥泄露：脚本里常见的 d & ((1<<k)-1)、d % 2**k、d_low
+    m = re.search(r"\bd\s*%\s*(?:2\s*\*\*\s*(\d+)|\(\s*1\s*<<\s*(\d+)\s*\))", t)
+    if m and ctx.d is None:
+        shot = next(g for g in m.groups() if g)
+        # d 的低 k 位是单独给的值：顺着找到它落的变量名
+        var = re.search(r"([A-Za-z_][A-Za-z_0-9]*)\s*=\s*[^=\n]*\bd\s*%\s*"
+                        r"(?:2\s*\*\*\s*\d+|\(\s*1\s*<<\s*\d+\s*\))", t)
+        if var:
+            nm, _ = _norm_name(var.group(1))
+            val = (singles.get(nm) or quoted.get(nm) or [None])[0]
+            if val:
+                ctx.d_low, ctx.d_low_bits = val, int(shot)
+                ctx.notes.append(f"检测到 d 的低 {shot} bit 泄露")
+
+    # RSA-CRT 故障签名：题面里同时出现「正确的消息」和「错掉的签名」
+    if ctx.sig is not None and ctx.signed_msg is None and ctx.c is not None:
+        ctx.signed_msg = ctx.c
+        ctx.notes.append("把 c 当作被签名的消息用于 Bellcore 校验")
+
     # 兜底：密文常以裸数字形式贴在注释里（如 "#12045854..."），没有 c= 前缀
-    known = {v for v in (ctx.n, ctx.e, ctx.c, ctx.p, ctx.q, ctx.d) if v}
+    known = {v for v in (ctx.n, ctx.e, ctx.c, ctx.p, ctx.q, ctx.d, ctx.sig,
+                         ctx.good_sig, ctx.signed_msg, ctx.near_p) if v}
     loose = []
     for m in re.finditer(_NUM, t):
         v = _to_int(m.group(0))
@@ -319,7 +369,8 @@ def parse_json(text: str) -> RSAContext:
             except (TypeError, ValueError):
                 val = v
             if isinstance(val, int):
-                if nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "phi"):
+                if nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "qinv", "phi",
+                          "near_p", "sig", "good_sig", "signed_msg"):
                     setattr(ctx, nm, val)
                 else:
                     ctx.hints[nm] = val
@@ -340,9 +391,17 @@ def parse_any(text: str) -> RSAContext:
 
 
 def from_pubkey_file(path: str) -> RSAContext:
-    """从 PEM/DER 公钥（或私钥）读 n、e。"""
+    """从 PEM/DER 公钥（或私钥）读 n、e；私钥文件连带读出 p、q、d 等。"""
     from Crypto.PublicKey import RSA
 
     with open(path, "rb") as f:
         key = RSA.import_key(f.read())
-    return RSAContext(n=key.n, e=key.e)
+    ctx = RSAContext(n=key.n, e=key.e)
+    if key.has_private():
+        ctx.d = key.d
+        ctx.p = key.p
+        ctx.q = key.q
+        if key.u:
+            ctx.qinv = key.u      # pycryptodome 的 u = q^-1 mod p
+        ctx.notes.append("从私钥文件读取到完整私钥")
+    return ctx
