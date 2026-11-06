@@ -31,6 +31,20 @@ class Options:
     total_timeout: float = 600.0
 
 
+def _sage_might_run(ctx: RSAContext, opts: Options) -> bool:
+    """判断本次求解是否可能触发 Sage。
+
+    与 `attacks.attack_sage_heavy` 的进入条件保持一致：需要 n、e、c 齐全，
+    且 `sage_heavy` 未被 only/skip 排除。Boneh-Durfee 与 p 高位等分支都在其中。
+    """
+    if not (ctx.n and ctx.e and ctx.c is not None):
+        return False
+    if opts.only and "sage_heavy" not in opts.only:
+        # 其它攻击（partial_d / nth_root）也可能用 Sage，但代价低，值得一并预热
+        return any(nm in opts.only for nm in ("partial_d", "boneh_durfee", "partial_p"))
+    return "sage_heavy" not in opts.skip
+
+
 def solve(ctx: RSAContext, opts: Optional[Options] = None,
           on_try: Optional[Callable[[str, str], None]] = None,
           on_done: Optional[Callable[[str, float, Optional[A.Result]], None]] = None
@@ -39,6 +53,31 @@ def solve(ctx: RSAContext, opts: Optional[Options] = None,
     A._SAGE_ENABLED = bool(getattr(opts, "use_sage", True))
     start = time.time()
 
+    # Sage 启动要约 6~10 秒：先偷偷拉起来，让它和前面的纯 Python 攻击重叠。
+    # 只有本次确实可能用到重型攻击时才预热（参数齐 + 没被 only/skip 排除），
+    # 否则光起一个用不上的 Sage 进程就白等好几秒。
+    prewarmed = False
+    if A._SAGE_ENABLED and _sage_might_run(ctx, opts):
+        from . import sagebridge as SB
+
+        SB.warm_up()
+        prewarmed = True
+
+    try:
+        res = _run_pipeline(ctx, opts, start, on_try, on_done)
+    finally:
+        # 没跑出结果又没用上 Sage：把预热的进程收掉，别吊着内存和解释器退出
+        if prewarmed and not A._SAGE_CACHE and not A._SAGE_TRIED:
+            from . import sagebridge as SB
+
+            SB.cancel_prewarm()
+    return res
+
+
+def _run_pipeline(ctx: RSAContext, opts: Options, start: float,
+                  on_try: Optional[Callable[[str, str], None]],
+                  on_done: Optional[Callable[[str, float, Optional[A.Result]], None]]
+                  ) -> Optional[A.Result]:
     # 只给了 p、q 没给 n：直接补全（题目常见写法）
     if ctx.n is None and ctx.p and ctx.q:
         ctx.n = ctx.p * ctx.q

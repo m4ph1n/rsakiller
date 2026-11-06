@@ -1175,6 +1175,8 @@ def attack_mt_replay(ctx: RSAContext, opts) -> Optional[Result]:
 _SAGE_CACHE: Dict[tuple, Optional[Result]] = {}
 # 由 solver 按 Options.use_sage 设置；纯 Python 模式必须真的不碰 Sage
 _SAGE_ENABLED = True
+# 未命中的 context 只记一次，避免同一进程内重复烧 Sage 计算
+_SAGE_TRIED: set = set()
 
 
 def _sage_ctx_key(ctx: RSAContext) -> tuple:
@@ -1185,7 +1187,8 @@ def _sage_ctx_key(ctx: RSAContext) -> tuple:
 def attack_sage_heavy(ctx: RSAContext, opts) -> Optional[Result]:
     """把 Coppersmith（p 高位 / 明文高位）与 Boneh-Durfee 一次性交给 Sage。
 
-    只付一次 Sage 启动成本（本机 Cygwin 版约 20~40 秒），结果按 context 缓存。
+    常驻 worker 复用后只付一次 Sage 启动成本（本机 Cygwin 版约 6~10 秒），
+    结果按 context 缓存。
     """
     if not (ctx.n and ctx.e and ctx.c is not None):
         return None
@@ -1198,6 +1201,9 @@ def attack_sage_heavy(ctx: RSAContext, opts) -> Optional[Result]:
     key = _sage_ctx_key(ctx)
     if key in _SAGE_CACHE:
         return _SAGE_CACHE[key]
+    if key in _SAGE_TRIED:
+        # 同一 context 已经跑过且没中：不必再烧一次 Sage 计算
+        return None
 
     n, e, c = ctx.n, ctx.e, ctx.c
     verbose = getattr(opts, "verbose", False)
@@ -1261,7 +1267,7 @@ def attack_sage_heavy(ctx: RSAContext, opts) -> Optional[Result]:
         meta.append(("boneh_durfee", None))
 
     if not jobs:
-        _SAGE_CACHE[key] = None
+        _SAGE_TRIED.add(key)
         return None
 
     if verbose:
@@ -1273,8 +1279,8 @@ def attack_sage_heavy(ctx: RSAContext, opts) -> Optional[Result]:
     results = SB.run_jobs(jobs, timeout=float(getattr(opts, "sage_timeout", 900.0)),
                           verbose=verbose)
     if results is None:
-        # Sage 不可用 / 超时：不缓存，留给纯 Python 兜底
-        _SAGE_CACHE[key] = None
+        # Sage 不可用 / 超时：只记"试过"，结果留给纯 Python 兜底重试
+        _SAGE_TRIED.add(key)
         return None
 
     for (kind, info), r in zip(meta, results):
@@ -1306,7 +1312,7 @@ def attack_sage_heavy(ctx: RSAContext, opts) -> Optional[Result]:
                     return res
         except Exception:
             continue
-    _SAGE_CACHE[key] = None
+    _SAGE_TRIED.add(key)
     return None
 
 
