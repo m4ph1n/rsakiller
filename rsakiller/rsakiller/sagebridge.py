@@ -35,6 +35,8 @@ _VERSION_TTL = 7 * 24 * 3600.0
 _BOOT_TIMEOUT = float(os.environ.get("RSAKILLER_SAGE_BOOT_TIMEOUT", "180"))
 
 _PROBE: Dict[str, Any] = {"done": False, "info": None, "err": ""}
+# 探测结果允许多线程同时查（预热线程会先发起探测）
+_PROBE_LOCK = threading.Lock()
 
 
 def _to_cygwin(path: str) -> str:
@@ -46,18 +48,31 @@ def _to_cygwin(path: str) -> str:
 
 
 def find_sage(force: bool = False) -> Optional[Dict[str, str]]:
-    """定位本机 Sage，返回 {"kind","sage","bash","python"}；找不到返回 None。"""
+    """定位本机 Sage，返回 {"kind","sage","bash","python"}；找不到返回 None。
+
+    结果进程内缓存；并发调用由 `_PROBE_LOCK` 串行化，避免读到半初始化的状态。
+    """
     if _PROBE["done"] and not force:
         return _PROBE["info"]
-    _PROBE["done"] = True
-    _PROBE["info"] = None
-    _PROBE["err"] = ""
+    with _PROBE_LOCK:
+        if _PROBE["done"] and not force:
+            return _PROBE["info"]
+        _PROBE["done"] = False
+        _PROBE["info"] = None
+        _PROBE["err"] = ""
+        _PROBE["info"] = _locate_sage()
+        _PROBE["done"] = True
+        if _PROBE["info"] is None and not _PROBE["err"]:
+            _PROBE["err"] = "未找到 SageMath 安装"
+        return _PROBE["info"]
 
+
+def _locate_sage() -> Optional[Dict[str, str]]:
+    """实际执行探测，由 `find_sage` 持锁调用。"""
     # 1) PATH 中的原生 sage
     exe = shutil.which("sage")
     if exe:
-        _PROBE["info"] = {"kind": "native", "sage": exe, "bash": "", "python": ""}
-        return _PROBE["info"]
+        return {"kind": "native", "sage": exe, "bash": "", "python": ""}
 
     # 2) Windows SageMath 安装包（Cygwin）
     bases: List[str] = []
@@ -83,15 +98,13 @@ def find_sage(force: bool = False) -> Optional[Dict[str, str]]:
                     pass
             # 必须用 Cygwin 内部路径（/opt/...），走 /cygdrive 会卡死
             rel = os.path.relpath(sage, os.path.join(d, "runtime")).replace("\\", "/")
-            _PROBE["info"] = {
+            return {
                 "kind": "cygwin",
                 "sage": "/" + rel,
                 "bash": bash,
                 # -python 跳过 sage 解释器初始化，比 -c 快约 3 秒
                 "python": "/" + rel.replace("/bin/sage", "/bin/python"),
             }
-            return _PROBE["info"]
-    _PROBE["err"] = "未找到 SageMath 安装"
     return None
 
 
@@ -315,7 +328,9 @@ _WORKER: Optional[_Worker] = None
 _WORKER_LOCK = threading.Lock()
 _WORKER_SEQ = 0
 # worker 起不来时置为 True，本次进程内不再重试，避免每个任务都白等一个启动超时
-_WORKER_DISABLED = False
+_WORKER_DISABLED = os.environ.get("RSAKILLER_SAGE_NO_WORKER", "") not in ("", "0")
+# 预热被取消（任务结束时 Sage 根本没用上）：线程收尾时直接关掉进程
+_CANCELLED = False
 
 
 def _worker_handle() -> Optional[_Worker]:
@@ -323,7 +338,11 @@ def _worker_handle() -> Optional[_Worker]:
 
 
 def _spawn_worker(deadline: float) -> Optional[_Worker]:
-    """拉起常驻 worker；失败返回 None（调用方回退一次性调用）。"""
+    """拉起常驻 worker；失败返回 None（调用方回退一次性调用）。
+
+    启动本身不持 `_WORKER_LOCK`（Sage 启动要好几秒，持锁会卡住退出路径）；
+    只在最后发布 `_WORKER` 时短暂持锁。
+    """
     global _WORKER, _WORKER_SEQ, _WORKER_DISABLED
     info = find_sage()
     if not info or _WORKER_DISABLED:
@@ -334,22 +353,98 @@ def _spawn_worker(deadline: float) -> Optional[_Worker]:
     if not worker.start(deadline):
         _WORKER_DISABLED = True
         return None
-    _WORKER = worker
+    with _WORKER_LOCK:
+        if _CANCELLED:
+            # 启动期间被取消（任务已经结束了）：别留着
+            worker.close()
+            return None
+        _WORKER = worker
     return worker
 
 
 def shutdown() -> None:
-    """关闭常驻 worker（幂等）。"""
-    global _WORKER
-    with _WORKER_LOCK:
-        if _WORKER is not None:
-            try:
-                _WORKER.close()
-            finally:
-                _WORKER = None
+    """关闭常驻 worker（幂等）。
+
+    解释器退出时调用：不等待预热线程，置位取消标志并直接杀进程，
+    避免退出被 Sage 启动耗时拖住。
+    """
+    cancel_prewarm()
+
+
+# 注意：`cancel_prewarm` 定义在下方预热小节，这里通过模块级名称在调用时解析。
 
 
 atexit.register(shutdown)
+
+
+# --------------------------------------------------------------------------
+# 预热：在后台把 worker 拉起来，让 Sage 启动与纯 Python 攻击重叠
+# --------------------------------------------------------------------------
+_PREWARM: Optional[threading.Thread] = None
+_PREWARM_LOCK = threading.Lock()
+
+
+def warm_up(timeout: float = _BOOT_TIMEOUT) -> None:
+    """异步启动常驻 worker，不阻塞调用方。
+
+    Sage 启动约 6~10 秒，而纯 Python 攻击通常在前几秒就结束；
+    在 `solve()` 开头预热可把这段启动时间藏进纯 Python 攻击的耗时里。
+    重复调用无副作用；worker 起不来时本次进程内不再尝试。
+    """
+    global _PREWARM, _CANCELLED
+    if _WORKER_DISABLED or _WORKER is not None:
+        return
+    with _PREWARM_LOCK:
+        if _PREWARM is not None and _PREWARM.is_alive():
+            return
+        if _WORKER is not None or _WORKER_DISABLED:
+            return
+        _CANCELLED = False
+
+        def run() -> None:
+            deadline = time.time() + max(1.0, float(timeout))
+            # 不持锁启动：持锁会让退出路径（shutdown/cancel）被 Sage 启动耗时卡住。
+            # 用 `_PREWARM_LOCK` 之外的状态保证同时只有一个预热在跑。
+            if _WORKER is not None or _WORKER_DISABLED or _CANCELLED:
+                return
+            _spawn_worker(deadline)
+
+        _PREWARM = threading.Thread(target=run, name="sage-prewarm", daemon=True)
+        _PREWARM.start()
+
+
+def _ensure_worker(deadline: float) -> Optional[_Worker]:
+    """拿到可用的 worker：等进行中的预热、复用现有进程，都没有才新起一个。"""
+    th = _PREWARM
+    if th is not None and th.is_alive() and _WORKER is None:
+        # 预热线程正在起进程（不持锁）：等它落地，避免同时拉起两个 Sage
+        th.join(max(0.0, deadline - time.time()))
+    with _WORKER_LOCK:
+        if _WORKER is not None:
+            return _WORKER
+        return _spawn_worker(min(deadline, time.time() + _BOOT_TIMEOUT))
+
+
+def cancel_prewarm() -> None:
+    """放弃预热：已起好的 worker 立即关掉；还没起完的让它收尾时自行关闭。
+
+    求解结束时若 Sage 一次都没用上，就不该继续等它启动，也不该留着
+    一个常驻进程吊住内存和解释器退出。这里不抢 `_WORKER_LOCK`——预热
+    线程可能正在发布新进程；只置 `_CANCELLED`，由 `_spawn_worker` 收尾。
+    """
+    global _CANCELLED, _WORKER
+    _CANCELLED = True
+    worker, _WORKER = _WORKER, None
+    if worker is not None:
+        worker.close()
+
+
+def join_prewarm(timeout: Optional[float] = None) -> bool:
+    """等待预热线程结束；返回 worker 是否可用。"""
+    th = _PREWARM
+    if th is not None:
+        th.join(timeout)
+    return _WORKER is not None
 
 
 # --------------------------------------------------------------------------
@@ -357,6 +452,7 @@ atexit.register(shutdown)
 # --------------------------------------------------------------------------
 def _run_once(info: Dict[str, str], jobs: List[Dict[str, Any]], resf: str,
               deadline: float) -> Optional[List[Dict[str, Any]]]:
+    """起一个一次性 Sage 进程执行任务，结果经结果文件返回。"""
     taskf = resf.replace("res_", "task_")
     try:
         with open(taskf, "w", encoding="utf-8") as f:
@@ -406,11 +502,10 @@ def run_jobs(jobs: List[Dict[str, Any]], timeout: float = 900.0,
 
     deadline = time.time() + max(1.0, float(timeout))
     t0 = time.time()
+    # 预热线程可能正在启动 worker：先让路，避免又起一个
+    reused = _WORKER is not None
+    worker = _ensure_worker(deadline)
     with _WORKER_LOCK:
-        worker = _WORKER
-        reused = worker is not None
-        if worker is None:
-            worker = _spawn_worker(min(deadline, time.time() + _BOOT_TIMEOUT))
         results: Optional[List[Dict[str, Any]]] = None
         if worker is not None:
             results = worker.request(jobs, deadline)
