@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -174,6 +175,113 @@ def attack_known_pq(ctx: RSAContext, opts) -> Optional[Result]:
         return decrypt_from_factors(ctx, {ctx.p: 1, ctx.n // ctx.p: 1})
     if ctx.q and ctx.n and ctx.n % ctx.q == 0:
         return decrypt_from_factors(ctx, {ctx.q: 1, ctx.n // ctx.q: 1})
+    return None
+
+
+def attack_phi_pair(ctx: RSAContext, opts) -> Optional[Result]:
+    """题面给了多个形如 (p-a)(q-b)=V 的泄露值时，线性组合导出 p±q（或 αp+βq），
+    配合 n=pq 解二次方程恢复 p、q 并解密。"""
+    n, e = ctx.n, ctx.e
+    if not (n and e and ctx.c is not None) or len(ctx.phi_pairs) < 2:
+        return None
+    pairs = ctx.phi_pairs
+    for i in range(len(pairs)):
+        a1, b1, v1 = pairs[i]
+        for j in range(len(pairs)):
+            if j == i:
+                continue
+            a2, b2, v2 = pairs[j]
+            # V = (p-a)(q-b) = n - a q - b p + a b
+            # V_i - V_j = (a_j-a_i) q + (b_j-b_i) p + (a_i b_i - a_j b_j)
+            alpha = a2 - a1          # 系数 of q
+            beta = b2 - b1           # 系数 of p
+            X = v2 - v1 + (a1 * b1 - a2 * b2)
+            if alpha == 0 or beta == 0:
+                continue
+            # alpha*q + beta*p = X, with p*q = n
+            # beta*p^2 - X*p + alpha*n = 0
+            disc = X * X - 4 * beta * alpha * n
+            if disc < 0:
+                continue
+            r = U.isqrt(disc)
+            if r * r != disc:
+                continue
+            for num in (X + r, X - r):
+                if num <= 0 or num % (2 * beta):
+                    continue
+                p = num // (2 * beta)
+                if p > 1 and n % p == 0 and p != n:
+                    res = decrypt_from_factors(ctx, {p: 1, n // p: 1})
+                    if res:
+                        res.attack = "phi_pair"
+                        res.detail = "由 (p-a)(q-b) 泄露值线性组合解出 p、q"
+                        return res
+    return None
+
+
+def attack_decimal_leak(ctx: RSAContext, opts) -> Optional[Result]:
+    """题面给了长小数 leak（如 Decimal((3p^2-1)/(3pq))），用连分数还原精确有理数 p/q。
+    典型：p、q 为不同素数，leak≈p/q，既约分数的分子/分母即 p、q。
+    已知 d（未知 n）时可直接解密。"""
+    if ctx.c is None or ctx.d is None:
+        return None
+    raw = getattr(ctx, "raw", "") or ""
+    m = re.search(r"([0-9]+\.[0-9]{60,})", raw)
+    if not m:
+        return None
+    s = m.group(1)
+    ip, fp = s.split(".")
+    # 精确有理数 leak = (ip + fp/10^len) 
+    from fractions import Fraction
+    val = Fraction(int(ip + fp), 10 ** len(fp))
+    num0, den0 = val.numerator, val.denominator
+    # 连分数展开，遍历收敛子
+    cf = U.continued_fraction(num0, den0)
+    seen = 0
+    for p, q in U.convergents(cf):
+        if p <= 1 or q <= 1:
+            continue
+        seen += 1
+        for cand_p, cand_q in ((p, q), (q, p)):
+            if not (U.is_probable_prime(cand_p) and U.is_probable_prime(cand_q)):
+                continue
+            n = cand_p * cand_q
+            try:
+                mm = U.powmod(ctx.c, ctx.d, n)
+            except Exception:
+                continue
+            b = U.long_to_bytes(mm)
+            if len(b) >= 4 and sum(32 <= x < 127 for x in b) / len(b) > 0.85:
+                return Result("decimal_leak", mm,
+                              f"连分数还原 leak≈p/q（第 {seen} 个收敛子），已知 d 解密")
+        if seen > 2000:
+            break
+    return None
+
+
+def attack_known_factor_root(ctx: RSAContext, opts) -> Optional[Result]:
+    """已知 n 的某个素因子 f（常来自 real_q / hint），且明文 m < f 时，
+    直接 c mod f 求 e 次根即还原明文，无需分解另一因子。
+    典型：n = 大合数 * 小素数，m 比小素数还短。"""
+    if not (ctx.n and ctx.e and ctx.c is not None):
+        return None
+    n, e, c = ctx.n, ctx.e, ctx.c
+    seen = set()
+    for f in (ctx.p, ctx.q, ctx.hints.get("known_factor")):
+        if not f or f <= 1 or f in seen:
+            continue
+        seen.add(f)
+        if f >= n or n % f != 0:
+            continue
+        if not U.is_probable_prime(f):
+            continue
+        d0 = U.inv(e, f - 1)
+        if d0 is None:
+            continue
+        m = U.powmod(c, d0, f)
+        if U.powmod(m, e, n) == c % n:
+            return Result("known_factor_root", m,
+                          f"已知素因子 {f.bit_length()} bit，明文 < 因子，直接 mod 开根")
     return None
 
 
@@ -861,16 +969,53 @@ def wiener_attack(n: int, e: int) -> Optional[int]:
     return None
 
 
+def attack_ab_quadratic(ctx: RSAContext, opts) -> Optional[Result]:
+    """题面给了 a、b（常见 b = q - p*a 形式）时，构建 a·p²+b·p-N=0 秒解 p。
+    校验：判别式必须为整平方，且解出的 p 整除 n。"""
+    n = ctx.n
+    a = ctx.hints.get("a")
+    b = ctx.hints.get("b")
+    if not (n and a and b and ctx.c is not None):
+        return None
+    disc = b * b + 4 * a * n
+    r = U.isqrt(disc)
+    if r * r != disc:
+        return None
+    # a·p² + b·p - n = 0，p = (-b + r) / (2a)
+    num = -b + r
+    if num <= 0 or num % (2 * a):
+        return None
+    p = num // (2 * a)
+    if p <= 1 or n % p != 0:
+        return None
+    res = decrypt_from_factors(ctx, {p: 1, n // p: 1})
+    if res:
+        res.attack = "ab_quadratic"
+        res.detail = f"a·p²+b·p-N=0（b=q-p·a）直接解出 p"
+    return res
+
+
 def attack_wiener(ctx: RSAContext, opts) -> Optional[Result]:
     if not (ctx.n and ctx.e and ctx.c is not None):
         return None
-    d = wiener_attack(ctx.n, ctx.e)
-    if d is None:
-        return None
-    m = U.powmod(ctx.c, d, ctx.n)
-    if U.powmod(m, ctx.e, ctx.n) != ctx.c % ctx.n:
-        return None
-    return Result("wiener", m, f"连分数恢复 d（{d.bit_length()} bit，远小于 n^0.25）")
+    # phi 可能是变体：phi=(p^a-1)(q^b-1) ≈ n^(a+b)/...，导致 e ≈ d^{-1} (mod n^t)。
+    # 仅对 e/n 展开连分数会漏；对 e/n、e/n^2、e/n^3、e/n^4 分别展开找候选 d。
+    # 收敛子 d 同时满足 ed ≡ 1 (mod (p-1)(q-1))，因此直接 pow 校验即可确认真私钥指数。
+    n, e, c = ctx.n, ctx.e, ctx.c
+    for k in range(1, 5):
+        den = n ** k
+        for cd, d in U.convergents(U.continued_fraction(e, den)):
+            if d <= 1:
+                continue
+            if (e * d - 1) % cd:
+                continue
+            m = U.powmod(c, d, n)
+            if U.powmod(m, e, n) != c % n:
+                continue
+            desc = (f"连分数恢复 d（{d.bit_length()} bit，对 e/n^{k} 展开）"
+                    if k > 1 else f"连分数恢复 d（{d.bit_length()} bit，远小于 n^0.25）")
+            return Result("wiener", m, desc)
+    return None
 
 
 def _recover_from_power_sum(n: int, k: int, T: int) -> Optional[int]:
@@ -1324,7 +1469,10 @@ Attack = Tuple[str, Callable[[RSAContext, object], Optional[Result]], str]
 PIPELINE: List[Attack] = [
     ("mt_replay", attack_mt_replay, "MT19937 状态恢复 + 素数重放"),
     ("known_pq", attack_known_pq, "已知 p、q 直接解密"),
+    ("phi_pair", attack_phi_pair, "(p-a)(q-b) 泄露值线性组合解 p、q"),
+    ("known_factor_root", attack_known_factor_root, "已知单素因子且明文更小，直接 mod 开根"),
     ("known_d", attack_known_d, "已知私钥 d"),
+    ("decimal_leak", attack_decimal_leak, "长小数 leak≈p/q 连分数还原"),
     ("known_phi", attack_known_phi, "已知 phi 反解 p、q"),
     ("dp_dq_leak", attack_dp_leak, "dp/dq 泄露"),
     ("c_gcd_n", attack_c_share_factor, "gcd(c,n) 泄露因子"),
@@ -1336,6 +1484,7 @@ PIPELINE: List[Attack] = [
     ("common_factor", attack_common_factor, "多模数共享素因子"),
     ("fermat", attack_fermat, "p、q 接近（Fermat）"),
     ("fermat_multiplier", attack_fermat_multiplier, "p、q 成小倍数关系（Fermat 乘子）"),
+    ("ab_quadratic", attack_ab_quadratic, "已知 a、b（b=q-p·a）二次方程直接解 p"),
     ("wiener", attack_wiener, "小私钥 d（连分数）"),
     ("approx_power", attack_approx_power, "e ≈ n^k·v/u 型（幂和反推分解）"),
     ("common_modulus", attack_common_modulus, "共模攻击"),

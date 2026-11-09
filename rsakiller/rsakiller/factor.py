@@ -60,7 +60,10 @@ def fermat(n: int, max_iter: int = 1_000_000) -> Optional[int]:
     return None
 
 
-def pollard_pm1(n: int, B1: int = 100_000, retries: int = 3) -> Optional[int]:
+def pollard_pm1(n: int, B1: int = 100_000, retries: int = 3,
+                known_m: int = 1) -> Optional[int]:
+    """Pollard p-1。known_m 是已知能整除某个 p-1 的因子（如题面给的 g/n1），
+    将其乘进指数可大幅扩大可破解的 p-1 形状（含一个大已知因子也 OK）。"""
     if n % 2 == 0:
         return 2
     for attempt in range(retries):
@@ -68,6 +71,8 @@ def pollard_pm1(n: int, B1: int = 100_000, retries: int = 3) -> Optional[int]:
         for p in small_primes(min(B1, 100_000)):
             e = int(math.log(B1) / math.log(p))
             a = U.powmod(a, p ** max(e, 1), n)
+        if known_m > 1:
+            a = U.powmod(a, known_m, n)
         g = U.gcd(a - 1, n)
         if 1 < g < n:
             return g

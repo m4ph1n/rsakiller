@@ -25,8 +25,8 @@ _NAME_MAP = {
     "n": "n", "nn": "n", "modulus": "n", "mod": "n", "nl": "n",
     "e": "e", "ee": "e", "exp": "e", "exponent": "e", "pubexp": "e",
     "c": "c", "cc": "c", "ct": "c", "cipher": "c", "ciphertext": "c", "enc": "c",
-    "p": "p", "pp": "p", "prime1": "p",
-    "q": "q", "qq": "q", "prime2": "q",
+    "p": "p", "pp": "p", "prime1": "p", "real_p": "p", "realp": "p",
+    "q": "q", "qq": "q", "prime2": "q", "real_q": "q", "realq": "q",
     "d": "d", "dd": "d", "priv": "d", "privkey": "d", "private": "d",
     "dp": "dp", "dq": "dq", "d_p": "dp", "d_q": "dq", "dmp1": "dp", "dmq1": "dq",
     "qinv": "qinv", "qi": "qinv", "q_inv": "qinv", "iqmp": "qinv",
@@ -81,6 +81,11 @@ def _norm_name(name: str) -> Tuple[str, Optional[int]]:
     if m:
         base, idx = m.group(1), int(m.group(2))
         low = base
+    # 位宽/长度词：绝不与 n / p / q 混淆（nbit=256 不是 n）
+    if low in ("nbit", "nbits", "bits", "bitlen", "keybits", "keysize", "bitsize",
+               "n_bits", "bit", "pbits", "qbits", "length", "nb", "keylength",
+               "n_bit", "bitss", "nlen", "key_len"):
+        return "bits", idx
     if low in _NAME_MAP:
         return _NAME_MAP[low], idx
     # 前缀匹配：如 p_low / q_high / n_big
@@ -119,6 +124,9 @@ class RSAContext:
     es: List[int] = field(default_factory=list)
     cs: List[int] = field(default_factory=list)
     triples: List[Tuple[int, int, int]] = field(default_factory=list)
+
+    # 泄露的 (p-a)(q-b) 值：list of (a, b, val)，形如 "(p-2)*(q-1)=<val>"
+    phi_pairs: List[Tuple[int, int, int]] = field(default_factory=list)
 
     hints: Dict[str, int] = field(default_factory=dict)
     leak_shift: Optional[int] = None      # 形如 hint = p >> 300
@@ -265,6 +273,12 @@ def parse_text(text: str) -> RSAContext:
     for nm in ("x", "y", "m"):
         if singles.get(nm):
             ctx.hints[nm] = singles[nm][0]
+    # a / b：常见于题面给出多项式/线性关系（如 b = q - p*a），存作 hint，
+    # 由对应攻击（二次方程分解、Coppersmith）去消费。只收较大的值以免误抓。
+    for nm in ("a", "b"):
+        vals = [v for v in (singles.get(nm) or []) if v > (1 << 100)]
+        if vals:
+            ctx.hints[nm] = vals[0]
 
     # >> 位移线索
     for m in _SHIFT_RE.finditer(t):
@@ -342,6 +356,20 @@ def parse_text(text: str) -> RSAContext:
         if k >= 19968:
             ctx.hints["mt_bits"] = k
             ctx.notes.append(f"脚本里 getrandbits({k})，够恢复 MT19937")
+
+    # (p-a)*(q-b) 型泄露：形如 #(p-2)*(q-1) = <val>（phi 的线性变形）
+    for pm in re.finditer(
+        r"\(\s*p\s*([+-])\s*(\d+)\s*\)\s*\*\s*\(\s*q\s*([+-])\s*(\d+)\s*\)\s*=\s*(" + _NUM + r")",
+        t, re.I):
+        s1, n1, s2, n2 = pm.group(1), int(pm.group(2)), pm.group(3), int(pm.group(4))
+        a = n1 if s1 == '-' else -n1   # (p-2) => a=2
+        b = n2 if s2 == '-' else -n2   # (q-1) => b=1
+        val = _to_int(pm.group(5))
+        if val is None:
+            continue
+        ctx.phi_pairs.append((a, b, val))
+    if ctx.phi_pairs:
+        ctx.notes.append(f"检测到 {len(ctx.phi_pairs)} 组 (p-a)(q-b) 泄露值")
     return ctx
 
 
