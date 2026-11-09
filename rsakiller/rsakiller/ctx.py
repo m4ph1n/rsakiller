@@ -41,7 +41,7 @@ _NAME_MAP = {
     "m": "m", "flag": "m", "msg": "m", "message": "m",
     "flag_ct": "c", "flagciphertext": "c", "flag_ciphertext": "c",
     "hint_ct": "hint_ct", "hintciphertext": "hint_ct", "hint_ciphertext": "hint_ct",
-    "x": "x", "y": "y",
+    "x": "x", "y": "y", "w": "w",
 }
 
 _NUM = r"(?:0[xX][0-9a-fA-F_]+[lL]?|\d[\d_]*[lL]?)"
@@ -127,6 +127,13 @@ class RSAContext:
 
     # 泄露的 (p-a)(q-b) 值：list of (a, b, val)，形如 "(p-2)*(q-1)=<val>"
     phi_pairs: List[Tuple[int, int, int]] = field(default_factory=list)
+
+    # 多重精确线性泄露 c_i = a_i*p + b_i*q（13_apbq 型，列表项均为大整数）
+    linear_leaks: List[int] = field(default_factory=list)
+    # DH 关系样本 (c, C=g^c mod r)（01_DHRSA 型），r 未知
+    dh_pairs: List[Tuple[int, int]] = field(default_factory=list)
+    # Pell 形态 gift：A*x^2 - B*y^2 == V（20_PECO 型），V==A 时化为 Pell 方程
+    pell_problem: Optional[dict] = None
 
     hints: Dict[str, int] = field(default_factory=dict)
     leak_shift: Optional[int] = None      # 形如 hint = p >> 300
@@ -249,6 +256,15 @@ def parse_text(text: str) -> RSAContext:
     if list_vals.get("es"):
         ctx.es = list_vals["es"]
 
+    # 嵌套模数（NestingDoll 型）：题面出现多个大 n 时，最大的是目标模数，
+    # 其余（如 inner modulus n1）保持在 ns 里供 kdp1 消费
+    if ctx.ns and ctx.n:
+        biggest = max(ctx.ns + [ctx.n])
+        if biggest != ctx.n:
+            ctx.ns = sorted({v for v in ctx.ns if v != biggest}, reverse=True)
+            ctx.n = biggest
+            ctx.notes.append("多个模数取最大者为目标，其余存入 ns（疑似嵌套模数）")
+
     # 组装三元的 (n, e, c)，用于广播 / 共模
     if ctx.ns and ctx.cs and len(ctx.ns) == len(ctx.cs):
         es = ctx.es if len(ctx.es) == len(ctx.ns) else [ctx.e or 3] * len(ctx.ns)
@@ -270,7 +286,7 @@ def parse_text(text: str) -> RSAContext:
             ctx.hints[nm] = singles[nm][0]
         elif quoted.get(nm):
             ctx.hints[nm] = quoted[nm][0]
-    for nm in ("x", "y", "m"):
+    for nm in ("x", "y", "m", "w"):
         if singles.get(nm):
             ctx.hints[nm] = singles[nm][0]
     # a / b：常见于题面给出多项式/线性关系（如 b = q - p*a），存作 hint，
@@ -370,6 +386,36 @@ def parse_text(text: str) -> RSAContext:
         ctx.phi_pairs.append((a, b, val))
     if ctx.phi_pairs:
         ctx.notes.append(f"检测到 {len(ctx.phi_pairs)} 组 (p-a)(q-b) 泄露值")
+
+    # 多重精确线性泄露：>=8 个大整数列表（13_apbq 型 hints）
+    for k, v in list_vals.items():
+        if len(v) >= 8 and all(x.bit_length() > 300 for x in v):
+            ctx.linear_leaks = v
+            ctx.notes.append(
+                f"检测到 {len(v)} 个大整数列表 hint[{k}]（疑似 a_i*p+b_i*q 线性泄露）")
+            break
+
+    # (c, C) 成对出现的 DH 关系样本（01_DHRSA 型 Try 输出）
+    dpairs = re.findall(r"\(\s*(\d{100,})\s*,\s*(\d{100,})\s*\)", t)
+    if len(dpairs) >= 4:
+        ctx.dh_pairs = [(int(a), int(b)) for a, b in dpairs]
+        ctx.notes.append(f"检测到 {len(dpairs)} 组 (c, C) 对（疑似 DH 关系样本）")
+
+    # A*x^2 - B*y^2 型 gift（20_PECO 型）：捕获两个系数
+    pm = re.search(
+        r"(\d{20,})\s*\*\s*x\s*\*\*\s*2\s*-\s*(\d{20,})\s*\*\s*y\s*\*\*\s*2", t)
+    if pm:
+        ctx.pell_problem = {"A": int(pm.group(1)), "B": int(pm.group(2))}
+        ctx.notes.append("检测到 A*x^2-B*y^2 型 Pell gift")
+        # V：题面/output 里的 gift 打印值（gift1= <数字>）
+        gv = re.search(r"gift\d*\s*=\s*(" + _NUM + r")", t)
+        if gv:
+            ctx.pell_problem["V"] = _to_int(gv.group(1))
+        # residue bound：assert (x*f0+y*f1)%m < 2**k
+        gb = re.search(r"%\s*m\s*<\s*(?:2\s*\*\*\s*(\d+)|\(?\s*1\s*<<\s*(\d+))", t)
+        if gb:
+            k = int(next(g for g in gb.groups() if g))
+            ctx.pell_problem["residue_bound"] = 1 << k
     return ctx
 
 

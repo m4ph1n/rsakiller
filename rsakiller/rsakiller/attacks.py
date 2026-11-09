@@ -1462,6 +1462,218 @@ def attack_sage_heavy(ctx: RSAContext, opts) -> Optional[Result]:
 
 
 # --------------------------------------------------------------------------
+# 多重线性泄露：c_i = a_i*p + b_i*q（13_apbq 型，C1 正交格）
+# --------------------------------------------------------------------------
+def attack_linear_leaks(ctx: RSAContext, opts) -> Optional[Result]:
+    """题面给了多个精确整数的 a_i*p + b_i*q 泄露值（a_i、b_i 未知但相对小）时，
+    用 C1 正交格恢复 p。13_apbq 实例需 m>=60；模块自带 m 阶梯与维度上限。"""
+    cs = getattr(ctx, "linear_leaks", None)
+    if not cs or not ctx.n or ctx.c is None:
+        return None
+    from . import ortholat
+    p = ortholat.ortholat_factor(cs, ctx.n, verbose=getattr(opts, "verbose", False))
+    if not p:
+        return None
+    res = decrypt_from_factors(ctx, {p: 1, ctx.n // p: 1})
+    if res:
+        res.attack = "ortholat"
+        res.detail = f"{len(cs)} 个线性泄露 a_i*p+b_i*q，正交格分解"
+        return res
+    return None
+
+
+# --------------------------------------------------------------------------
+# known-divisor Pollard p-1（19_NestingDoll 型）
+# --------------------------------------------------------------------------
+def attack_kdp1(ctx: RSAContext, opts) -> Optional[Result]:
+    """题面给出嵌套模数/种子积且其整除 p-1 时，用放大的 Pollard p-1 分解。"""
+    n = ctx.n
+    if not n or ctx.c is None:
+        return None
+    cands = []
+    for k in ("n1", "seed", "known_multiplier", "inner_n", "nest"):
+        v = ctx.hints.get(k)
+        if isinstance(v, int) and v > 1 and v < n:
+            cands.append(v)
+    for v in ctx.ns:
+        if v and v != n and v < n and v.bit_length() > 64:
+            cands.append(v)
+    if not cands:
+        return None
+    from . import kdp1
+    from . import factor as F
+    seen = set()
+    for mult in cands:
+        if mult in seen:
+            continue
+        seen.add(mult)
+        # n 可能是多素数模数（NestingDoll 型 p*q*r*s）：逐个除尽。
+        # 每除掉一个素数，剩余因子的光滑度要求上移，需要细化的 B1 escalation
+        # （真实 19 题实测：B1 ≈ 1e6/1.01e6/1.03e6/1.045e6 依次捕获 4 个素数）。
+        # 总时长护栏：每层 B1 的 lcm+powmod 在 4096-bit 模数上 ~10-60s，
+        # 用墙钟上限防止最坏情况跑飞（用户机器内存有限）。
+        fac: Dict[int, int] = {}
+        remaining = n
+        # NestingDoll 实测：p−1 各含一个 512-bit seed + 20-bit smooth 部分，
+        # 捕获的 B1 依次 1e6/1.03e6/1.04e6/1.045e6。用 kdp1_levels 一次算好
+        # 各层的 a，再逐层 gcd，增量里析取因子（避免每层重扫）。
+        schedule = [10**6, 1_010_000, 1_030_000, 1_040_000, 1_045_000]
+        t_all = time.time()
+        try:
+            levels = kdp1.kdp1_levels(remaining, [mult], schedule,
+                                      verbose=getattr(opts, "verbose", False))
+        except Exception:
+            levels = []
+        prev_g = 1
+        for B1, a, _dt in levels:
+            if remaining <= 1 or time.time() - t_all > 600:
+                break
+            g = int(U.gcd(a - 1, remaining))
+            if g <= 1:
+                continue
+            # gcd 是「已捕获素数之积 × prev 已知部分」：增量 = g 中超出
+            # prev_g 的部分。对增量做质因数拆解（增量通常 <= 2048-bit，
+            # 且都是素数或素数之积，直接逐个 gcd 剥离）。
+            incr = g
+            while incr > 1 and U.is_probable_prime(incr):
+                p = incr
+                if remaining % p != 0:
+                    break
+                e_local = 0
+                while remaining % p == 0:
+                    remaining //= p
+                    e_local += 1
+                fac[p] = e_local
+                incr //= p
+            if incr > 1:
+                # 增量是合数：用 Fermat/rho 快速拆（增量是同类素数之积，
+                # 位宽接近，Fermat 极快）
+                from . import factor as F
+                for _ in range(4):
+                    fp = F.fermat(incr, max_iter=100000) if incr > 1 else None
+                    if not fp:
+                        break
+                    for q_ in (fp, incr // fp):
+                        if U.is_probable_prime(q_) and remaining % q_ == 0:
+                            e_local = 0
+                            while remaining % q_ == 0:
+                                remaining //= q_
+                                e_local += 1
+                            fac[q_] = e_local
+                    incr = incr // _prod({fp: 1}) if incr % fp == 0 else incr
+                    if U.is_probable_prime(incr):
+                        continue
+                # 拆不动的整块也记录（decrypt_from_factors 需要）
+                if incr > 1 and remaining % incr == 0:
+                    e_local = 0
+                    while remaining % incr == 0:
+                        remaining //= incr
+                        e_local += 1
+                    fac[incr] = e_local
+            if remaining > 1 and U.is_probable_prime(remaining):
+                fac[remaining] = 1
+                break
+        if fac and _prod(fac) == n:
+            # NestingDoll 型收尾：外层素数 P = seed·smooth + 1，
+            # seed = (P-1) 剥掉 <=2^20 小素数后的剩余（512-bit）。
+            # 4 个 seed 之积 == inner 模数 n1，密文在 n1 上。
+            seeds = []
+            for P in fac:
+                x = P - 1
+                for sq in F.small_primes(1_050_000):
+                    while x % sq == 0:
+                        x //= sq
+                seeds.append(x)
+            prod_seeds = 1
+            for s in seeds:
+                prod_seeds *= s
+            inner = ctx.hints.get("n1") or (ctx.ns[0] if ctx.ns else None)
+            if inner and prod_seeds == inner:
+                phi = 1
+                for s in seeds:
+                    phi *= (s - 1)
+                d = U.inv(ctx.e, phi)
+                if d is not None:
+                    m = U.powmod(ctx.c, d, inner)
+                    if U.powmod(m, ctx.e, inner) == ctx.c % inner:
+                        return Result("kdp1", m,
+                                      "kdp1 分解外层 → extract_seed 还原 seeds（积=inner n1）→ 解密")
+            res = decrypt_from_factors(ctx, fac)
+            if res:
+                res.attack = "kdp1"
+                res.detail = (f"known-divisor Pollard p-1（倍数 {mult.bit_length()} bit，"
+                              f"{len(fac)} 个素因子）")
+                return res
+    return None
+
+
+def _prod(fac: Dict[int, int]) -> int:
+    v = 1
+    for p, k in fac.items():
+        v *= p ** k
+    return v
+
+
+# --------------------------------------------------------------------------
+# DH 关系样本：(c, C=g^c mod r) 恢复未知模数 r（01_DHRSA 型）
+# --------------------------------------------------------------------------
+def attack_dh_relations(ctx: RSAContext, opts) -> Optional[Result]:
+    """题面给出多组 (c, C) 且 C=g^c mod 未知 r、外加 n=p*q 时，LLL 零关系恢复 r，
+    Pohlig-Hellman 求离散对数还原 p、q。整链较重（每次 dlog ~20s），放在中段。"""
+    pairs = getattr(ctx, "dh_pairs", None)
+    if not pairs or not ctx.n or ctx.c is None:
+        return None
+    X = ctx.hints.get("x") or ctx.hints.get("X")
+    W = ctx.hints.get("w") or ctx.hints.get("W")
+    if not (X and W):
+        return None
+    from . import dhrel
+    try:
+        out = dhrel.solve_dhrsa(pairs, X, W, ctx.n, ctx.c, ctx.e or 65537,
+                                verbose=getattr(opts, "verbose", False))
+    except Exception:
+        return None
+    if not out or not out.get("m"):
+        return None
+    p, q = out.get("p"), out.get("q")
+    fac = {p: 1, q: 1} if (p and q and p * q == ctx.n) else {}
+    return Result("dhrel", out["m"], "LLL 零关系恢复 r → PH-DLP 还原 p,q", fac)
+
+
+# --------------------------------------------------------------------------
+# Pell 方程 gift + 有界断言（20_PECO 型）
+# --------------------------------------------------------------------------
+def attack_pell_lattice(ctx: RSAContext, opts) -> Optional[Result]:
+    """题面给出 A*x^2 - B*y^2 == A 型 gift（Pell 方程）与 (x*f0+y*f1) mod m
+    有界断言时，用 Pell 基本解 + 3 维格恢复 flag 两段。
+
+    不依赖密文 c：flag 恢复只靠 gift 系数与断言（m 是解出来的 1876-bit 素数）。
+    """
+    pp = getattr(ctx, "pell_problem", None)
+    if not pp:
+        return None
+    A, B = pp.get("A"), pp.get("B")
+    # V（gift 值）与 residue_bound 从题面解析；m 是解密出来的 1876-bit 素数，
+    # 通常作为独立大数出现在题面/数据里 —— hints["m"] 是它的落点
+    V = pp.get("V")
+    m = pp.get("m") or ctx.hints.get("m")
+    bound = pp.get("residue_bound")
+    if not (V and m and bound):
+        return None
+    from . import pell
+    try:
+        out = pell.pell_attack(A, B, V, m, bound,
+                               verbose=getattr(opts, "verbose", False))
+    except Exception:
+        return None
+    if out and len(out) >= 5 and out[4]:
+        flag_bytes = out[4]
+        return Result("pell_lattice", U.bytes_to_long(flag_bytes),
+                      f"Pell x^2-{out[0]}*y^2=1 基本解 + 3 维格恢复 flag 两半")
+    return None
+
+
+# --------------------------------------------------------------------------
 # 注册表：顺序即优先级
 # --------------------------------------------------------------------------
 Attack = Tuple[str, Callable[[RSAContext, object], Optional[Result]], str]
@@ -1491,6 +1703,10 @@ PIPELINE: List[Attack] = [
     ("hastad", attack_hastad, "低指数广播"),
     ("small_e_root", attack_small_e_root, "低指数小明文直接开方"),
     ("short_pad", attack_short_pad, "短填充（明文的差很小且未知）"),
+    ("dhrel", attack_dh_relations, "DH 样本 (c,g^c mod r) 恢复未知模数并解密"),
+    ("pell_lattice", attack_pell_lattice, "Pell 方程 gift + 有界断言恢复 flag"),
+    ("ortholat", attack_linear_leaks, "多重线性泄露 a*p+b*q 正交格分解"),
+    ("kdp1", attack_kdp1, "known-divisor Pollard p-1（嵌套模数放大指数）"),
     ("sage_heavy", attack_sage_heavy, "Sage 重型（Coppersmith / Boneh-Durfee）"),
     ("franklin_reiter", attack_franklin_reiter, "相关消息攻击"),
     ("partial_p", attack_partial_p, "已知 p 高位/低位（纯 Python Coppersmith）"),
