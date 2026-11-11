@@ -20,7 +20,8 @@ CTF RSA 通杀工具：自动解析题目参数，按「廉价攻击 → Sage �
 | `rsakiller/oracle.py` | 加解密/根运算封装 |
 | `rsakiller/factor.py` | FactorDB 与通用分解 |
 | `rsakiller/sagebridge.py` | 自动定位本机 Sage，JSON 任务协议，一次进程内批量跑完全部重型候选 |
-| `rsakiller/sage_scripts/heavy.py` | Sage 侧实现：Coppersmith、Boneh-Durfee、Franklin-Reiter 等 |
+| `rsakiller/sage_scripts/heavy.py` | Sage 侧实现：Coppersmith、Boneh-Durfee、Franklin-Reiter、qInv+dq 枚举、e 高位二次方程、退化椭圆曲线等 |
+| `rsakiller/ec.py` | 椭圆曲线攻击的纯 Python 侧（退化曲线分解、还原 e·P 原像） |
 
 ## 用法
 
@@ -43,6 +44,17 @@ python -m rsakiller -n 0x.. -e 65537 --near-p 0x..
 python -m rsakiller -n 0x.. -e 3 --d-low 0x.. --d-known-bits 300
 python -m rsakiller -n 0x.. -e 65537 --sig 0x.. --signed-msg 0x..
 
+# qInv + dq 低位（CISCN2024 ez_rsa 型；这是本轮新解出的题型）
+python -m rsakiller chal.txt --only qinv_dq_low --qhunt-procs 4
+# 已知 k 的大致范围时可大幅加速
+python -m rsakiller chal.txt --only qinv_dq_low --qhunt-k-lo 40000 --qhunt-k-hi 50000
+
+# e 的高位泄露（CISCN2024 OvO 型：e = e >> 200 << 200）
+python -m rsakiller task.py output.txt --only e_high_leak
+
+# 退化椭圆曲线（07 型：E: y²=x³+p·x+q，系数 a=p、b=q 就是 n 的因子）
+python -m rsakiller challenge.sage output.txt --only ec_degenerate
+
 # 已知明文的前后缀，中间一段未知
 python -m rsakiller -n 0x.. -e 3 -c 0x.. --prefix 'flag{' --suffix '}' --unknown-len 16
 
@@ -55,6 +67,10 @@ python -m rsakiller --list
 `python -m rsakiller --list` 会打印完整列表。按能力分组：
 
 **参数泄露 / 直接解密**：`known_pq`、`known_d`、`known_phi`、`dp_dq_leak`、`d_leak`、`c_gcd_n`、`rsa_crt_fault`（Bellcore 故障签名）、`mt_replay`（MT19937 重放）
+
+**部分密钥 / 高位泄露**：`qinv_dq_low`（qInv + dq 低位，枚举 k 的 Coppersmith —— **单看 qInv 等价于分解 n，但配上 dq 低 48 bit 就落进 Coppersmith 可行域**）、`e_high_leak`（e 由 p、q 组合且低位被抹零：先解近似二次方程取 p 初值，再用 Coppersmith 补足）
+
+**椭圆曲线**：`ec_degenerate`（退化曲线 —— `E: y²=x³+p·x+q` 的系数 a=p、b=q **就是 n 的因子**，mod p 时 a≡0 使曲线退化，于是 `q ≡ Cy²−Cx³ (mod p)` 成为模未知因子的小根；分解后再在两条退化曲线上各求一次 e 的逆元还原 P）
 
 **低指数 / 共模 / 相关消息**：`small_e_root`、`hastad`、`common_modulus`（含 gcd(e₁,e₂)>1）、`franklin_reiter`、`short_pad`（填充差未知）、`stereotyped`（已知明文前后缀）
 
@@ -76,8 +92,42 @@ python -m rsakiller --list
 
 ```bash
 python tests/selftest.py --no-sage     # 24 项纯 Python
-python tests/selftest.py --with-sage   # 26 项，含格攻击
+python tests/selftest.py --with-sage   # 29 项，含格攻击与三项新攻击
 ```
+
+**注意**：含 Sage 的项必须在**系统 Python** 下跑。用 Sage 自带的 python 跑会失败——
+它没有 pycryptodome，且 `find_sage()` 会返回 Cygwin 内路径（`/opt/.../src/bin/sage`），
+Windows 下不可执行，导致 `run_jobs` 拿不到结果。
+
+## 关于重型攻击的耗时
+
+`qinv_dq_low` 要对 `k ∈ [1, e)` 逐个跑一次 dim=11 的 LLL，**全量约 2.6 小时（4 进程）**：
+
+| 场景 | 实测 |
+|---|---|
+| 单次 LLL（dim=11） | ~0.11 s |
+| 单核吞吐 | ~0.43 s/k |
+| 4 进程并行 | ~2.1x（本机拐点，8 进程反降到 1.9x） |
+
+所以它默认参与管线，但**强烈建议**用 `--qhunt-k-lo/--qhunt-k-hi` 限定区间；
+`k` 无法从公开量先验缩小范围（`e·dq_low − 1 ≡ k·q − k (mod 2^48)` 里 `q` 也未知），
+只有 `v2(k) ≤ v2(e·dq_low−1)` 这一条免费的筛选。
+
+**Sage 在受限沙箱下起不来**：Windows 版 SageMath 的 Cygwin 运行时需要创建命名管道，
+被文件沙箱拒绝时 bash 会直接死在 `couldn't create signal pipe, Win32 error 5`。
+遇到「Sage 不可用」但 `sage --version` 能跑，先检查是不是沙箱拦的。
+
+**常驻 worker 的两个通路陷阱**（都已在 `sagebridge.py` 修掉，改这里时别退回旧写法）：
+
+1. `_ensure_worker` 不能持 `_WORKER_LOCK` 调 `_spawn_worker` —— 后者发布结果要拿同一把
+   非重入锁，会自锁死。表现为首次 `run_jobs` 永久卡住。
+2. worker 的 stdout 必须由**唯一一个后台线程**逐行读进队列，主线程从队列带超时地取。
+   旧写法「每次起线程读一行 + join 超时」在超时后那个线程仍阻塞在管道上，
+   随后 `close()` 关 stdout 要与它抢缓冲锁，同样永久死锁。
+
+两条的表现都是「卡住不返回」，不是报错 —— 排查时先怀疑这类，而不是 Sage 慢。
+一次性调用（`run_shards`）**绝不能用 `capture_output=True`**：Cygwin bash 拉起的孙进程
+会继承管道写端，bash 先退出时 `subprocess.run` 读到 EOF 前会一直阻塞，`timeout=` 也救不回来。
 
 ## Sage 集成说明
 

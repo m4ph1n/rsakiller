@@ -29,6 +29,12 @@ class Options:
     only: List[str] = field(default_factory=list)
     skip: List[str] = field(default_factory=list)
     total_timeout: float = 600.0
+    # qinv_dq_low 对 k∈[1,e) 逐个试 LLL，全量很贵（本机 4 进程约 2.6 小时）。
+    # 下面三项把这件事变成可控的：可只扫一段、可改并行度。
+    qhunt_procs: int = 0                     # 0 = 自动（取 min(4, CPU)，实测 4 路到顶）
+    qhunt_k_lo: int = 1
+    qhunt_k_hi: int = 0                      # 0 = 用 e（全量）
+    qhunt_sec_per_k: float = 0.43            # 单 k 实测耗时，用于执行前估算预算
 
 
 def _sage_might_run(ctx: RSAContext, opts: Options) -> bool:

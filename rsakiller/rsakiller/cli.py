@@ -51,7 +51,7 @@ def _build_ctx(args) -> RSAContext:
         ctx = parse_any(raw) if raw.strip() else RSAContext()
     # 命令行参数优先级最高
     for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "qinv", "phi",
-               "near_p", "sig", "good_sig", "signed_msg"):
+               "near_p", "sig", "good_sig", "signed_msg", "dq_low"):
         v = getattr(args, nm, None)
         if v is not None:
             setattr(ctx, nm, v)
@@ -175,6 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dp", type=lambda s: int(s, 0))
     p.add_argument("--dq", type=lambda s: int(s, 0))
     p.add_argument("--qinv", type=lambda s: int(s, 0), help="q 关于 p 的模逆")
+    p.add_argument("--dq-low", type=lambda s: int(s, 0),
+                   help="dq 的低若干位（配 --qinv 可分解，见 qinv_dq_low）")
     p.add_argument("--phi", type=lambda s: int(s, 0), help="欧拉函数 phi(n)")
     p.add_argument("--near-p", type=lambda s: int(s, 0), help="p 的近似值（差一点点）")
     p.add_argument("--d-low", type=lambda s: int(s, 0), help="d 的低若干位（partial key exposure）")
@@ -193,6 +195,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-online", action="store_true", help="禁止联网查 FactorDB")
     p.add_argument("--no-bd", action="store_true", help="跳过 Boneh-Durfee（省时间）")
     p.add_argument("--no-sage", action="store_true", help="禁用 Sage，仅用纯 Python")
+    p.add_argument("--qhunt-procs", type=int, default=0,
+                   help="qinv_dq_low 枚举 k 时的并行进程数（默认 min(4, CPU 数)）")
+    p.add_argument("--qhunt-k-lo", type=int, default=1,
+                   help="qinv_dq_low 枚举 k 的起点（默认 1）")
+    p.add_argument("--qhunt-k-hi", type=int, default=0,
+                   help="qinv_dq_low 枚举 k 的终点，不含（默认 e，即全量）")
     p.add_argument("--sage-timeout", type=float, default=900.0, help="Sage 批量任务总超时（秒）")
     p.add_argument("--bd-delta", type=float, default=0.26, help="Boneh-Durfee 的 delta 假设")
     p.add_argument("--max-k", type=int, default=200_000, help="低指数爆破上限 k")
@@ -246,6 +254,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         related=tuple(int(x) for x in args.related.split(",")) if args.related else None,
         only=[s.strip() for s in args.only.split(",")] if args.only else [],
         skip=[s.strip() for s in args.skip.split(",")] if args.skip else [],
+        qhunt_procs=args.qhunt_procs,
+        qhunt_k_lo=args.qhunt_k_lo,
+        qhunt_k_hi=args.qhunt_k_hi,
     )
 
     if not args.json:
@@ -312,6 +323,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("=" * 72)
     print("  未命中任何自动攻击")
     print("=" * 72)
+    # 攻击在执行中被跳过的原因（预算不足、分片没跑完等）必须显式告诉用户，
+    # 否则"没跑"和"跑了但不存在"看起来一样。
+    pending = [n for n in ctx.notes if "未执行" in n or "没跑完" in n]
+    if pending:
+        print("  未跑完的攻击：")
+        for n in pending:
+            print(f"    - {n}")
+        print()
     print("  " + explain(ctx, None).replace("\n", "\n  "))
     print(f"\n  总耗时 {total:.2f}s")
     return 1

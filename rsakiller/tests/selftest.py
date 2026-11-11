@@ -231,7 +231,11 @@ def t_e_divides_phi():
     m = (m_of(FLAG) << 200) | rand_int(200)
     assert m ** 3 > n
     c = U.powmod(m, e, n)
-    check("e 与 phi 不互素", RSAContext(n=n, e=e, c=c, p=p, q=q), m)
+    # 这一档要走 Sage 的 nth_root：worker 刚起 + 生成 9|p−1 的素数，实测 54~260 秒，
+    # 默认 60 秒上限会让它随机失败（与攻击本身无关，是测试预算问题）。
+    check("e 与 phi 不互素", RSAContext(n=n, e=e, c=c, p=p, q=q), m,
+          Options(online=False, use_sage="--no-sage" not in sys.argv,
+                  sage_timeout=600.0))
 
 
 # ---------------------------------------------------------------- 补齐的题型
@@ -422,6 +426,83 @@ def t_partial_p_sage():
           FLAG, Options(online=False, sage_timeout=1200.0))
 
 
+def t_qinv_dq_low():
+    """只有 qInv = q^{-1} mod p 与 dq 的低 L bit（CISCN2024 ez_rsa 型）。
+
+    这条攻击要对 k ∈ [1, e) 逐个跑一次 dim=11 的 LLL，全量在测试里跑不起
+    （本机 4 进程约 26 分钟）。所以**限定 k 区间把真 k 圈进去**：
+    用真实 k 反推出窗口，验证的是"给定区间能命中"，而不是"全量扫得动"。
+    全量自动命中已在真实 22 题数据上单独验证过（见 work/toolwork/checkin）。
+    """
+    p, q, n = make_key(512)
+    e = 65537
+    d = inverse(e, (p - 1) * (q - 1))
+    dq = d % (q - 1)
+    k_true = (e * dq - 1) // (q - 1)
+    L = 48
+    dq_low = dq & ((1 << L) - 1)
+    qinv = inverse(q, p)
+    m = m_of(FLAG)
+    c = U.powmod(m, e, n)
+    opts = Options(online=False, sage_timeout=1800.0, qhunt_procs=2,
+                   qhunt_k_lo=max(1, int(k_true) - 120),
+                   qhunt_k_hi=int(k_true) + 120)
+    check("qInv + dq 低位", RSAContext(n=n, e=e, c=c, qinv=qinv, dq_low=dq_low),
+          FLAG, opts)
+
+
+def t_ec_degenerate():
+    """退化椭圆曲线：Weierstrass 系数就是 n 的两个因子（07_babyRSA 型）。
+
+    构造小实例：E: y² = x³ + p·x + q over Z_n，给出 n 与 C = e·P 的坐标。
+    曲线用 p:q = 2:1 的位宽比（与真实题一致），否则 β 的取值不同。
+
+    注意本项必须在**系统 Python** 里跑（不是 Sage 的 python）：它要用 sagebridge
+    再拉起一个 Sage 子进程求 small_roots，若自己就在 Sage 里跑，
+    `find_sage()` 会返回 Cygwin 内路径（/opt/.../src/bin/sage），Windows 下不可执行。
+    """
+    # 生成参数需要 Sage；用 sagebridge 让 Sage 侧算好再返回，避免本进程依赖 sage.all
+    from rsakiller import sagebridge as SB
+
+    if not SB.available():
+        raise RuntimeError("本项需要 Sage")
+    # n 必须比明文长（真实题：n 1535 bit、明文 192 字节=1536 bit，只差 1 bit，
+    # 于是 x0 + k·n 只有 2 个候选）。若 n 明显短于明文，k 的范围会有天文数字个，
+    # 那种实例不具代表性、也解不出来。
+    nbytes = 64
+    gen = SB.run_jobs([{"op": "ec_make_instance", "pbits": 512, "qbits": 256,
+                        "msg": "flag{ec_degenerate_synthetic}", "nbytes": nbytes}],
+                      timeout=600)
+    if not gen or not gen[0].get("ok"):
+        raise RuntimeError("生成实例失败: %s" % (gen[0].get("err") if gen else "None"))
+    g = gen[0]
+    ctx = RSAContext(n=int(g["n"]), e=65537)
+    ctx.ec_point = (int(g["Cx"]), int(g["Cy"]))
+    ctx.ec_msg_bytes = nbytes
+    check("退化椭圆曲线", ctx, g["msg"].encode(),
+          Options(online=False, sage_timeout=1800.0))
+
+
+def t_e_high_leak():
+    """e 由 p、q 组合而成且低 200 位被清零（CISCN2024 OvO 型）。"""
+    import random
+
+    p, q, n = make_key(512)
+    m = m_of(FLAG)
+    # 构造与真实题同形的 e：e = 65537 + kk·p + (kk+2)((p+1)(q+1)) + 1
+    while True:
+        kk = getPrime(128)
+        rr = kk + 2
+        e_full = 65537 + kk * p + rr * ((p + 1) * (q + 1)) + 1
+        if U.gcd(e_full, (p - 1) * (q - 1)) == 1:
+            break
+    e_given = e_full >> 200 << 200
+    c = U.powmod(m, e_full, n)
+    ctx = RSAContext(n=n, e=e_given, c=c)
+    ctx.leak_shift = 200            # 题面里 e = e >> 200 << 200
+    check("e 高位泄露(OvO)", ctx, FLAG, Options(online=False, sage_timeout=1800.0))
+
+
 def main():
     print("=" * 72)
     print("  rsakiller 自测：为每类攻击合成一道题")
@@ -456,6 +537,9 @@ def main():
         tests += [
             ("p 高位(大参数/Sage)", t_partial_p_sage),
             ("Boneh-Durfee(Sage)", t_boneh_durfee_sage),
+            ("qInv + dq 低位", t_qinv_dq_low),
+            ("退化椭圆曲线", t_ec_degenerate),
+            ("e 高位泄露(OvO)", t_e_high_leak),
         ]
     for _, fn in tests:
         try:

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -1674,6 +1675,216 @@ def attack_pell_lattice(ctx: RSAContext, opts) -> Optional[Result]:
 
 
 # --------------------------------------------------------------------------
+# qInv + dq 低位（CISCN2024 ez_rsa / checkin 型）
+# --------------------------------------------------------------------------
+def _dq_low_bits(dq: int) -> int:
+    """dq 的已知位数。dq 若为完整值就不该走这条攻击。"""
+    return U.nbit(dq) if dq else 0
+
+
+def attack_qinv_dq_low(ctx: RSAContext, opts) -> Optional[Result]:
+    """已知 qInv = q^{-1} mod p 与 dq 的低若干位时，逐个 k 试 Coppersmith 恢复 q。
+
+    这条攻击的来源是一个反直觉的事实：单看 qInv 无法分解 n（等价于分解），
+    但只要再多知道 dq 的低 L bit，未知量就降到 (n^{1/2})/2^L，
+    落进 deg=2、beta=1 的 Coppersmith 可行域。k ∈ [1,e) 须逐个尝试，
+    每个 k 一次 dim=12 的 LLL；命中判据是 q = (e·dq-1)/k+1 整除 n。
+    """
+    n, e, qinv, dq = ctx.n, ctx.e, ctx.qinv, (ctx.dq or ctx.dq_low)
+    if not (n and e and qinv and dq):
+        return None
+    if dq >= n or n % dq == 0:
+        return None                      # 已经是完整 dq 或明显不是低位
+    L = _dq_low_bits(dq)
+    half = (U.nbit(n) + 1) // 2
+    # 未知量 X = 2^(half-L)；Coppersmith 要求 X < n^{1/2}，留 8 bit 余量
+    if L < 8 or L > half - 16:
+        return None
+    if not getattr(opts, "use_sage", True):
+        return None
+    from . import sagebridge as SB
+
+    if not SB.available():
+        return None
+    verbose = getattr(opts, "verbose", False)
+
+    # k 的上界就是 e；按进程数切片，每片一次一次性调用（各付一次 Sage 启动）
+    procs = int(getattr(opts, "qhunt_procs", 0) or 0)
+    if procs <= 0:
+        # 实测：4 路是这台机器的性价比拐点（2.1x），8 路反而退化到 1.9x
+        procs = min(4, os.cpu_count() or 1)
+    k_lo = max(1, int(getattr(opts, "qhunt_k_lo", 1) or 1))
+    k_hi = int(getattr(opts, "qhunt_k_hi", 0) or 0) or int(e)
+    if k_hi <= k_lo:
+        return None
+    span = max(1, (k_hi - k_lo + procs - 1) // procs)
+    batches = []
+    for i in range(procs):
+        lo = k_lo + i * span
+        hi = min(k_hi, lo + span)
+        if lo >= hi:
+            continue
+        batches.append([{"op": "qhunt", "n": str(n), "e": int(e), "qinv": str(qinv),
+                         "dq_low": str(dq), "L": L, "k_lo": lo, "k_hi": hi,
+                         "m": 5, "t": 1}])
+    if not batches:
+        return None
+    # 每片要跑 (k_hi-k_lo)/procs 个 k，实测每个 k 约 0.43 秒（dim=11 一次 LLL 加求根，
+    # 再按并行效率打折）。预算不足时不能闷头超时 —— 那样只是白烧 CPU 再报"未命中"，
+    # 得算清楚、说清楚，让用户知道这是「没算完」而不是「不存在」。
+    per_k = float(getattr(opts, "qhunt_sec_per_k", 0.0) or 0.43)
+    per_shard = max(b[0]["k_hi"] - b[0]["k_lo"] for b in batches)
+    need = per_shard * per_k + 20.0          # 每片含一次 Sage 启动
+    budget = float(getattr(opts, "sage_timeout", 900.0))
+    if need > budget:
+        total_h = (k_hi - k_lo) * per_k / max(1, procs) / 3600.0
+        ctx.notes.append(
+            "qinv_dq_low 未执行：k∈[%d,%d) 共 %d 个，分 %d 片每片约需 %.0fs，"
+            "超过预算 %.0fs（全量约 %.1f 小时）。"
+            "请用 --sage-timeout %d 或 --qhunt-k-lo/--qhunt-k-hi 限定区间"
+            % (k_lo, k_hi, k_hi - k_lo, len(batches), need, budget, total_h,
+               int(need) + 60))
+        return None
+    if verbose:
+        print("    [qhunt] qInv + dq 低 %d bit：k∈[%d,%d) 分 %d 片并行（每片约 %.0fs）"
+              % (L, k_lo, k_hi, len(batches), need))
+    results = SB.run_shards(batches, timeout=float(getattr(opts, "sage_timeout", 900.0)),
+                            procs=procs, verbose=verbose)
+    if not results:
+        return None
+    for part in results:
+        if not part:
+            continue
+        r = part[0]
+        if not r or not r.get("ok"):
+            continue
+        q = int(r["value"])
+        if q > 1 and n % q == 0:
+            res = decrypt_from_factors(ctx, {q: 1, n // q: 1})
+            if res:
+                res.attack = "qinv_dq_low"
+                res.detail = ("qInv + dq 低 %d bit：枚举 k=%s 后 Coppersmith 恢复 q"
+                              % (L, r.get("k")))
+                return res
+    # 有分片没跑完（超时/崩溃）时，"没命中"不等于"不存在"：留给总超时提示
+    pending = getattr(SB.run_shards, "last_timeouts", None) or []
+    if pending:
+        ctx.notes.append(
+            "qinv_dq_low: %d/%d 个 k 分片没跑完，结果不完整（加大 --sage-timeout 或减 --qhunt-procs 重试）"
+            % (len(pending), len(batches)))
+    return None
+
+
+# --------------------------------------------------------------------------
+# e 的高若干位（CISCN2024 OvO 型）
+# --------------------------------------------------------------------------
+def attack_e_high_leak(ctx: RSAContext, opts) -> Optional[Result]:
+    """e 由 p、q 组合而成且低若干位被清零时，解近似二次方程 + Coppersmith 恢复 p。
+
+    识别特征：e 远大于 n（e/n 有几百位），且题面出现了 >>k 的清零操作。
+    这类题不能当"大 e 小 d"处理：e 的真实低位是被抹掉的，Wiener/BD 都不适用。
+    """
+    n, e, c = ctx.n, ctx.e, ctx.c
+    if not (n and e and c):
+        return None
+    # 结构判定：这类题的 e 由 p、q 组合而成，量级是 n 的许多倍（OvO 约 2^128 倍），
+    # 必须明显大于 n；单看 e//n-2 > 0 就够，不必设 4n 这种粗略门槛。
+    if e // n - 2 <= 0:
+        return None
+    leak_bits = ctx.leak_shift or 0
+    if leak_bits < 32:
+        return None
+    if not getattr(opts, "use_sage", True):
+        return None
+    from . import sagebridge as SB
+
+    if not SB.available():
+        return None
+    res = SB.run_jobs([{"op": "high_leak_quadratic", "n": str(n), "e": str(e),
+                        "c": str(c), "leak_bits": leak_bits}],
+                      timeout=float(getattr(opts, "sage_timeout", 900.0)),
+                      verbose=getattr(opts, "verbose", False))
+    if not res or not res[0].get("ok"):
+        return None
+    try:
+        m = int(res[0]["value"])
+        p = int(res[0]["p"])
+    except (KeyError, ValueError):
+        return None
+    if U.powmod(m, int(res[0]["e_full"]), n) != c % n:
+        return None
+    return Result("e_high_leak", m,
+                  "e 的高位泄露：近似二次方程取 p 初值 + Coppersmith 补低位",
+                  {p: 1, n // p: 1})
+
+
+# --------------------------------------------------------------------------
+# 退化椭圆曲线：系数即 n 的因子（07_babyRSA 型）
+# --------------------------------------------------------------------------
+def attack_ec_degenerate(ctx: RSAContext, opts) -> Optional[Result]:
+    """曲线 E: y²=x³+p·x+q over Z_n（系数就是因子）时，由已知点反推 q 并还原明文。
+
+    模 p 时 a=p≡0，曲线退化为 y²=x³+q，因此任何已知点都给出一条
+        q ≡ Cy² − Cx³  (mod p)
+    而 q 只有 p 的一半位宽左右，是「模未知因子 p」的小根 ⇒ Coppersmith 直接求出。
+    拿到 q 即分解 n，再在两条退化曲线上各求一次 e 的逆元还原 P。
+    """
+    n, e = ctx.n, ctx.e
+    if not (n and e and ctx.ec_point):
+        return None
+    Cx, Cy = ctx.ec_point
+    if not getattr(opts, "use_sage", True):
+        return None
+    from . import sagebridge as SB
+
+    if not SB.available():
+        return None
+    verbose = getattr(opts, "verbose", False)
+
+    # 因子位数比未知：07 题是 p:q = 2:1（β≈0.66）。多试几档 β，
+    # 上界取 n^(β²)，β 越大要求的未知量越小、但覆盖的因子比例越高。
+    for beta in (0.66, 0.6, 0.5, 0.7):
+        res = SB.run_jobs([{"op": "ec_factor", "n": str(n), "Cx": str(Cx),
+                            "Cy": str(Cy), "beta": beta}],
+                          timeout=float(getattr(opts, "sage_timeout", 900.0)),
+                          verbose=verbose)
+        if not res or not res[0].get("ok"):
+            continue
+        q = int(res[0]["value"])
+        if not (1 < q < n and n % q == 0):
+            continue
+        p = n // q
+        if verbose:
+            print("    [ec] 因子 %d bit / %d bit（beta=%.2f）" % (p.bit_length(), q.bit_length(), beta))
+        # 还原点：明文固定长度由题面给出（如 urandom(192-len(flag)) ⇒ 192 字节）。
+        # 不给就只能拿 x0 本身，n 短于明文时无法挑出真值。
+        nbytes = int(getattr(opts, "ec_msg_bytes", 0) or ctx.ec_msg_bytes or 0)
+        rec = SB.run_jobs([{"op": "ec_recover", "n": str(n), "Cx": str(Cx),
+                            "Cy": str(Cy), "e": int(e), "p": str(p), "q": str(q),
+                            "nbytes": nbytes}],
+                          timeout=float(getattr(opts, "sage_timeout", 900.0)),
+                          verbose=verbose)
+        if not rec or not rec[0].get("ok"):
+            continue
+        for cand_s in rec[0].get("candidates") or []:
+            cand = int(cand_s)
+            blob = cand.to_bytes(max(1, (cand.bit_length() + 7) // 8), "big")
+            flag = _flag_from_bytes(blob)
+            if flag:
+                return Result("ec_degenerate", U.bytes_to_long(flag),
+                              "退化曲线 q ≡ Cy²−Cx³ (mod p) → Coppersmith 分解 n → 还原 e·P 原像",
+                              {p: 1, q: 1})
+    return None
+
+
+def _flag_from_bytes(blob: bytes) -> Optional[bytes]:
+    """从字节流里切出 flag；要求形如 `<前缀>{...}` 且前缀是常见赛事名。"""
+    m = re.search(rb"(?:flag|FLAG|ctf|CTF|DASCTF|NSSCTF|ISCC|NCO|SCTF|NCTF)\{[^}\n]{1,140}\}",
+                  blob)
+    return m.group(0) if m else None
+
+
+# --------------------------------------------------------------------------
 # 注册表：顺序即优先级
 # --------------------------------------------------------------------------
 Attack = Tuple[str, Callable[[RSAContext, object], Optional[Result]], str]
@@ -1687,6 +1898,9 @@ PIPELINE: List[Attack] = [
     ("decimal_leak", attack_decimal_leak, "长小数 leak≈p/q 连分数还原"),
     ("known_phi", attack_known_phi, "已知 phi 反解 p、q"),
     ("dp_dq_leak", attack_dp_leak, "dp/dq 泄露"),
+    ("qinv_dq_low", attack_qinv_dq_low, "qInv + dq 低位（枚举 k 的 Coppersmith）"),
+    ("e_high_leak", attack_e_high_leak, "e 的高位泄露（近似二次方程 + Coppersmith）"),
+    ("ec_degenerate", attack_ec_degenerate, "退化椭圆曲线（系数即因子）"),
     ("c_gcd_n", attack_c_share_factor, "gcd(c,n) 泄露因子"),
     ("rsa_crt_fault", attack_rsa_crt_fault, "RSA-CRT 故障签名（Bellcore）"),
     ("d_leak", attack_d_factor, "已知 d 反推因子"),

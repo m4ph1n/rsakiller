@@ -17,11 +17,13 @@ import atexit
 import glob
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -184,6 +186,8 @@ class _Worker:
         self.log_path = log_path
         self.version = ""
         self.proc: Optional[subprocess.Popen] = None
+        # stdout 由一个后台线程独占读取，主线程只从队列取（见 _read_line 的说明）
+        self._lines: Optional["queue.Queue[Optional[str]]"] = None
 
     def _cmd(self) -> List[str]:
         info = self.info
@@ -218,31 +222,42 @@ class _Worker:
             return False
         finally:
             log.close()
+        self._lines = queue.Queue()
+        threading.Thread(target=self._pump, args=(self.proc.stdout,),
+                         name="sage-stdout", daemon=True).start()
         ready = self._read_until_ready(deadline)
         if not ready:
             self.close()
         return ready
 
     def _read_line(self, deadline: float) -> Optional[str]:
-        """带截止时间读一行；超时或 EOF 返回 None。"""
-        assert self.proc is not None and self.proc.stdout is not None
-        box: Dict[str, Any] = {}
+        """带截止时间读一行；超时或 EOF 返回 None。
 
-        def read() -> None:
-            try:
-                box["line"] = self.proc.stdout.readline()
-            except Exception as exc:  # 管道被关闭等
-                box["err"] = exc
+        不能"起线程读一行 + join 超时"：超时后那个线程仍阻塞在管道上，
+        随后 `close()` 关闭 stdout 会与它抢同一把缓冲锁，进程永久卡死。
+        改成由后台线程把所有行推进队列，这里只带超时地从队列取 ——
+        读者永远只有一个，关闭时不会有两个线程争同一流。
+        """
+        assert self._lines is not None
+        remaining = max(0.0, deadline - time.time())
+        try:
+            item = self._lines.get(timeout=remaining)
+        except queue.Empty:
+            return None
+        if item is None:                  # 读到 EOF：后台线程投递的哨兵
+            return None
+        return item
 
-        th = threading.Thread(target=read, daemon=True)
-        th.start()
-        th.join(max(0.0, deadline - time.time()))
-        if th.is_alive() or "line" not in box:
-            return None
-        line = box["line"]
-        if not line:
-            return None
-        return line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+    def _pump(self, stream) -> None:
+        """后台线程：逐行读 stdout 投递到队列，结束（含异常）时投 None。"""
+        try:
+            for raw in iter(stream.readline, b""):
+                self._lines.put(raw.decode("utf-8", "replace")
+                                if isinstance(raw, bytes) else str(raw))
+        except Exception:
+            pass
+        finally:
+            self._lines.put(None)
 
     def _read_until_ready(self, deadline: float) -> bool:
         while time.time() < deadline:
@@ -308,12 +323,13 @@ class _Worker:
                 proc.wait(timeout=10)
             except Exception:
                 pass
-        for stream in (proc.stdin, proc.stdout):
-            try:
-                if stream:
-                    stream.close()
-            except OSError:
-                pass
+        # 只关 stdin。stdout 由 `_pump` 线程独占读，进程退出后它自会读到 EOF；
+        # 这里再 close() 会与读线程争同一把缓冲锁，把关闭动作卡死。
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
 
     def tail(self, limit: int = 800) -> str:
         try:
@@ -414,7 +430,11 @@ def warm_up(timeout: float = _BOOT_TIMEOUT) -> None:
 
 
 def _ensure_worker(deadline: float) -> Optional[_Worker]:
-    """拿到可用的 worker：等进行中的预热、复用现有进程，都没有才新起一个。"""
+    """拿到可用的 worker：等进行中的预热、复用现有进程，都没有才新起一个。
+
+    注意**不能持 `_WORKER_LOCK` 调 `_spawn_worker`**：后者发布结果时要拿同一把
+    非重入锁，持锁调用会自锁死（Sage 启动要好几秒，表现为整条链路永久卡住）。
+    """
     th = _PREWARM
     if th is not None and th.is_alive() and _WORKER is None:
         # 预热线程正在起进程（不持锁）：等它落地，避免同时拉起两个 Sage
@@ -422,7 +442,7 @@ def _ensure_worker(deadline: float) -> Optional[_Worker]:
     with _WORKER_LOCK:
         if _WORKER is not None:
             return _WORKER
-        return _spawn_worker(min(deadline, time.time() + _BOOT_TIMEOUT))
+    return _spawn_worker(min(deadline, time.time() + _BOOT_TIMEOUT))
 
 
 def cancel_prewarm() -> None:
@@ -452,8 +472,14 @@ def join_prewarm(timeout: Optional[float] = None) -> bool:
 # --------------------------------------------------------------------------
 def _run_once(info: Dict[str, str], jobs: List[Dict[str, Any]], resf: str,
               deadline: float) -> Optional[List[Dict[str, Any]]]:
-    """起一个一次性 Sage 进程执行任务，结果经结果文件返回。"""
+    """起一个一次性 Sage 进程执行任务，结果经结果文件返回。
+
+    stdout/stderr 一律重定向到文件，**不用管道**：Cygwin 的 bash 会再拉一个
+    sage python 孙进程，孙进程会继承管道写端；一旦 bash 先退出，`subprocess.run`
+    读到 EOF 之前会一直阻塞，连 `timeout=` 都救不回来（Windows 上的已知陷阱）。
+    """
     taskf = resf.replace("res_", "task_")
+    logf = resf.replace("res_", "log_")
     try:
         with open(taskf, "w", encoding="utf-8") as f:
             json.dump(jobs, f)
@@ -469,8 +495,19 @@ def _run_once(info: Dict[str, str], jobs: List[Dict[str, Any]], resf: str,
                    "'%s' -python '%s' '%s' '%s'"
                    % (info["sage"], _to_cygwin(_SCRIPT), _to_cygwin(taskf), _to_cygwin(resf))]
         remaining = max(1.0, deadline - time.time())
-        proc = subprocess.run(cmd, capture_output=True, timeout=remaining, env=env,
-                              stdin=subprocess.DEVNULL)
+        with open(logf, "wb") as log:
+            proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                    env=env)
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                # 进程超时：连同它拉起的子进程一起收掉，别留在后台吃 CPU
+                try:
+                    proc.kill()
+                    proc.wait(timeout=30)
+                except Exception:
+                    pass
+                return None
         if not os.path.exists(resf):
             return None
         with open(resf, encoding="utf-8") as f:
@@ -478,10 +515,11 @@ def _run_once(info: Dict[str, str], jobs: List[Dict[str, Any]], resf: str,
     except Exception:
         return None
     finally:
-        try:
-            os.unlink(taskf)
-        except OSError:
-            pass
+        for tmp in (taskf, logf):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def run_jobs(jobs: List[Dict[str, Any]], timeout: float = 900.0,
@@ -524,11 +562,71 @@ def run_jobs(jobs: List[Dict[str, Any]], timeout: float = 900.0,
                     os.unlink(resf)
                 except OSError:
                     pass
-    if verbose:
+    if verbose and results is None:
+        print("    [sage] 批任务 %d 个未拿到结果（超时或 Sage 进程异常退出）" % len(jobs))
+    elif verbose:
         mode = "复用" if reused else ("常驻 worker" if worker is not None else "未复用")
         print("    [sage] 批任务 %d 个，用时 %.1fs，%s"
               % (len(jobs), time.time() - t0, mode))
     return results
+
+
+def run_shards(batches: List[List[Dict[str, Any]]], timeout: float = 900.0,
+               procs: int = 1, verbose: bool = False) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
+    """把若干批任务分发给多个独立 Sage 进程并行跑，返回各批结果。
+
+    每批走一次性调用（各自一个 Sage 进程），因为常驻 worker 是单进程串行。
+    多进程只在"单个任务就要跑很久"的场景值得：一次性调用各付一次启动成本
+    （本机 Cygwin 版约 8 秒），换来的是 N 倍算力。
+
+    `timeout` 是**整组**的墙钟预算，但每批各自从启动时刻起算自己那份：
+    并行跑 N 批时共用一个绝对截止时间，会让所有批在同一个时刻一起被判超时，
+    于是"还没算完"被误当成"没有结果"。返回按输入顺序对齐的列表，单批
+    失败处填 None；`timed_out` 里记录哪几批是被超时打断的，调用方可据此
+    区分"真没有"和"没算完"。
+    """
+    info = find_sage()
+    if not info or not batches:
+        return None
+    try:
+        os.makedirs(_TMPDIR, exist_ok=True)
+    except OSError:
+        return None
+    procs = max(1, min(int(procs), len(batches)))
+    # 每批拿到完整预算：并行时批与批之间不互相抢时间
+    per_batch = max(1.0, float(timeout))
+    out: List[Optional[List[Dict[str, Any]]]] = [None] * len(batches)
+    timed_out: List[int] = []
+    t0 = time.time()
+
+    def one(idx: int) -> None:
+        token = "%d_%d_%d" % (os.getpid(), idx, int(time.time() * 1000) % 10_000_000)
+        resf = os.path.join(_TMPDIR, "res_%s.json" % token)
+        batch_deadline = time.time() + per_batch
+        try:
+            out[idx] = _run_once(info, batches[idx], resf, batch_deadline)
+        finally:
+            try:
+                os.unlink(resf)
+            except OSError:
+                pass
+        if out[idx] is None:
+            timed_out.append(idx)
+
+    with _SHARD_LOCK:
+        with _ThreadPoolExecutor(max_workers=procs) as pool:
+            list(pool.map(one, range(len(batches))))
+    if verbose:
+        msg = "    [sage] 并行 %d 批 × %d 进程，用时 %.1fs" % (
+            len(batches), procs, time.time() - t0)
+        if timed_out:
+            msg += "，其中 %d 批超时/失败" % len(timed_out)
+        print(msg)
+    run_shards.last_timeouts = sorted(timed_out)      # 供调用方判断是否"没算完"
+    return out
+
+
+_SHARD_LOCK = threading.Lock()
 
 
 def selftest() -> str:

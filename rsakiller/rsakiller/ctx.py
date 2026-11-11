@@ -30,7 +30,11 @@ _NAME_MAP = {
     "d": "d", "dd": "d", "priv": "d", "privkey": "d", "private": "d",
     "dp": "dp", "dq": "dq", "d_p": "dp", "d_q": "dq", "dmp1": "dp", "dmq1": "dq",
     "qinv": "qinv", "qi": "qinv", "q_inv": "qinv", "iqmp": "qinv",
-    "pinv": "pinv", "p_inv": "pinv", "ipmq": "pinv",
+    "inv": "qinv", "invq": "qinv", "coefficient": "qinv", "coeff": "qinv",
+    "p_inv": "pinv", "ipmq": "pinv",
+    # dq 的低位泄露（checkin / ez_rsa 型）
+    "dqlow": "dq_low", "dq_low": "dq_low", "dql": "dq_low", "dq_l": "dq_low",
+    "low_dq": "dq_low", "dqlo": "dq_low", "dq_lowbits": "dq_low",
     "phi": "phi", "phin": "phi", "phip": "phi", "varphi": "phi", "fn": "phi",
     "hint": "hint", "leak": "leak", "high": "hint", "p_high": "hint",
     "ph": "hint", "leak_p": "hint", "hp": "hint", "pbar": "hint",
@@ -127,6 +131,17 @@ class RSAContext:
 
     # 泄露的 (p-a)(q-b) 值：list of (a, b, val)，形如 "(p-2)*(q-1)=<val>"
     phi_pairs: List[Tuple[int, int, int]] = field(default_factory=list)
+
+    # dq 的低位泄露值（checkin / ez_rsa 型），配合 qinv 走 qinv_dq_low 攻击
+    dq_low: Optional[int] = None
+
+    # 椭圆曲线题：曲线定义在 Z_n 上且系数疑似为因子（07_babyRSA 型）。
+    # 元组为 (Cx, Cy)，即题目输出的那个点坐标。
+    ec_point: Optional[Tuple[int, int]] = None
+    # 该题明文的固定字节长度：07 题为 bytes_to_long(flag + urandom(192-len(flag)))，
+    # 即 x 恰好 192 字节。CRT 只给出 x mod n（n 比 192 字节短），
+    # 必须靠这个长度才能把真值从 x0 + k·n 里挑出来。
+    ec_msg_bytes: Optional[int] = None
 
     # 多重精确线性泄露 c_i = a_i*p + b_i*q（13_apbq 型，列表项均为大整数）
     linear_leaks: List[int] = field(default_factory=list)
@@ -227,11 +242,16 @@ def parse_text(text: str) -> RSAContext:
             quoted.setdefault(nm, []).append(val)
 
     # 单值直接落位（普通赋值优先，引号形式补缺）
+    #
+    # 同一参数出现多个赋值时取最大者：题目脚本里常先写初始化常量
+    # （如 `e = 65537` 占位、`n = p * q`），真值在后面的 print 输出区。
+    # 脚本 + output.txt 一起喂是本工具推荐用法，若按出现顺序取首个，
+    # 脚本里的占位常量会覆盖掉真实数据。
     for nm in ("n", "e", "c", "p", "q", "d", "dp", "dq", "qinv", "phi",
-               "near_p", "sig", "good_sig", "signed_msg"):
+               "near_p", "sig", "good_sig", "signed_msg", "dq_low"):
         vals = [v for v in (singles.get(nm) or quoted.get(nm) or []) if v > 0]
         if vals:
-            setattr(ctx, nm, vals[0])
+            setattr(ctx, nm, max(vals))
 
     # 多值：n1..nk / c1..ck / e1..ek
     if len(singles.get("n", [])) > 1:
@@ -330,6 +350,42 @@ def parse_text(text: str) -> RSAContext:
             if val:
                 ctx.d_low, ctx.d_low_bits = val, int(shot)
                 ctx.notes.append(f"检测到 d 的低 {shot} bit 泄露")
+
+    # qInv + dq 低位（checkin / ez_rsa 型）：dq 只给了低位时落在 dq_low 字段
+    if ctx.dq_low:
+        ctx.notes.append("检测到 dq 的低位泄露，可配 qInv 走 qinv_dq_low")
+
+    # 退化椭圆曲线（07_babyRSA 型）：EllipticCurve(Zmod(n), [p, q]) —— 系数就是因子，
+    # 且题目把一个点的坐标以元组形式打印出来。这是比"分解 n"便宜得多的入口。
+    if re.search(r"EllipticCurve\s*\(\s*(?:Zmod\s*\(\s*n\s*\)|Zmod\s*\(\s*N\s*\)|"
+                 r"GF\s*\(\s*n\s*\))", t) and re.search(r"\[\s*p\s*,\s*q\s*\]", t):
+        pt = re.findall(r"\(\s*(\d{40,})\s*,\s*(\d{40,})\s*\)", t)
+        if pt:
+            ctx.ec_point = (int(pt[-1][0]), int(pt[-1][1]))
+            ctx.notes.append(
+                "检测到退化椭圆曲线（系数即 n 的因子）+ 点坐标，可走 ec_degenerate")
+            # 这类题常把 n 以裸数字单独 print 一行（没有 `n =` 前缀），
+            # 且 n 与点坐标位数相近。取「不比坐标短、又不等于坐标分量」的最大孤立数。
+            if ctx.n is None:
+                cx, cy = ctx.ec_point
+                pool = []
+                for mm in re.finditer(_NUM, t):
+                    v = _to_int(mm.group(0))
+                    if v is None or v in (cx, cy) or v < (1 << 128):
+                        continue
+                    pool.append(v)
+                if pool:
+                    ctx.n = max(pool, key=lambda x: x.bit_length())
+                    ctx.notes.append("n 由输出中的孤立大整数推断（裸 print 形式）")
+            # 明文固定字节长度：bytes_to_long(flag + os.urandom(192 - len(flag)))
+            mm = re.search(r"urandom\s*\(\s*(\d+)\s*-\s*len\s*\(\s*flag\s*\)\s*\)", t)
+            if mm:
+                ctx.ec_msg_bytes = int(mm.group(1))
+                ctx.notes.append(
+                    "明文固定 %d 字节（urandom(%s-len(flag))），用于解开 CRT 代表元"
+                    % (ctx.ec_msg_bytes, mm.group(1)))
+        else:
+            ctx.notes.append("检测到退化椭圆曲线，但未找到输出的点坐标")
 
     # RSA-CRT 故障签名：题面里同时出现「正确的消息」和「错掉的签名」
     if ctx.sig is not None and ctx.signed_msg is None and ctx.c is not None:
